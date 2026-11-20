@@ -349,6 +349,21 @@ bool ClientState::try_get_element_work_state(std::uint16_t elementNumber, bool &
 	return false;
 }
 
+void ClientState::clear_rate_elements()
+{
+	rateElements.clear();
+}
+
+void ClientState::add_rate_element(const RateElement &element)
+{
+	rateElements.push_back(element);
+}
+
+const std::vector<RateElement> &ClientState::get_rate_elements() const
+{
+	return rateElements;
+}
+
 MyTCServer::MyTCServer(std::shared_ptr<isobus::InternalControlFunction> internalControlFunction,
                        isobus::TaskControllerServer::TaskControllerVersion version) :
   TaskControllerServer(internalControlFunction,
@@ -891,6 +906,39 @@ void MyTCServer::request_measurement_commands()
 				}
 			}
 
+			// Map the settable rate DDIs (1/6/11) so update_rate_setpoint() knows which elements to address.
+			// Interim until channels can be assigned per element: every rate element is on channel 1.
+			client.second.clear_rate_elements();
+			for (std::uint32_t i = 0; i < client.second.get_pool().size(); i++)
+			{
+				auto object = client.second.get_pool().get_object_by_index(i);
+				if (!object || object->get_object_type() != isobus::task_controller_object::ObjectTypes::DeviceProcessData)
+				{
+					continue;
+				}
+
+				auto processDataObject = std::dynamic_pointer_cast<isobus::task_controller_object::DeviceProcessDataObject>(object);
+				if (!processDataObject || !is_rate_setpoint_ddi(processDataObject->get_ddi()))
+				{
+					continue;
+				}
+
+				const auto &entry = isobus::DataDictionary::get_entry(processDataObject->get_ddi());
+				if (!processDataObject->has_property(isobus::task_controller_object::DeviceProcessDataObject::PropertiesBit::Settable))
+				{
+					log("Rate") << "DDI " << processDataObject->get_ddi() << " (" << entry.to_string() << ") is declared but not settable, so no rate is sent to it" << std::endl;
+					continue;
+				}
+
+				std::uint16_t elementNumber = 0;
+				if (find_owning_element_number(client.second.get_pool(), *processDataObject, elementNumber))
+				{
+					client.second.add_rate_element({ processDataObject->get_ddi(), elementNumber, 1 });
+					log("Rate") << "Mapped DDI " << processDataObject->get_ddi() << " (" << entry.to_string() << ") on element "
+					            << elementNumber << " to rate channel 1 (interim: channel 1 drives every rate element)" << std::endl;
+				}
+			}
+
 			log() << "Measurement commands sent." << std::endl;
 			client.second.mark_measurement_commands_sent();
 
@@ -1018,6 +1066,91 @@ void MyTCServer::send_all_section_setpoint_states(std::shared_ptr<isobus::Contro
 	for (std::uint8_t block = 0; block * NUMBER_SECTIONS_PER_CONDENSED_MESSAGE < numberOfSections; block++)
 	{
 		send_section_setpoint_states(client, block, true);
+	}
+}
+
+bool MyTCServer::is_rate_setpoint_ddi(std::uint16_t ddi)
+{
+	return ddi == static_cast<std::uint16_t>(isobus::DataDescriptionIndex::SetpointVolumePerAreaApplicationRate) ||
+	  ddi == static_cast<std::uint16_t>(isobus::DataDescriptionIndex::SetpointMassPerAreaApplicationRate) ||
+	  ddi == static_cast<std::uint16_t>(isobus::DataDescriptionIndex::SetpointCountPerAreaApplicationRate);
+}
+
+void MyTCServer::send_rate_to_elements(std::uint8_t channel, std::uint16_t ddi, std::int32_t value)
+{
+	for (auto &client : clients)
+	{
+		for (const auto &element : client.second.get_rate_elements())
+		{
+			if (element.channel == channel && element.ddi == ddi)
+			{
+				send_set_value(client.first, ddi, element.elementNumber, value);
+			}
+		}
+	}
+}
+
+void MyTCServer::update_rate_setpoint(std::uint8_t channel, std::uint16_t ddi, std::int32_t value)
+{
+	if (channel < 1 || channel > MAX_RATE_CHANNELS || !is_rate_setpoint_ddi(ddi))
+	{
+		return;
+	}
+
+	std::lock_guard<std::recursive_mutex> lock(clientsMutex);
+	RateChannel &rate = rateChannels[channel - 1];
+	const std::uint32_t now = isobus::SystemTiming::get_timestamp_ms();
+	value = std::max<std::int32_t>(value, 0);
+
+	if (rate.ddi != 0 && rate.ddi != ddi && !rate.lost)
+	{
+		send_rate_to_elements(channel, rate.ddi, 0); // the channel changed DDI: stop the elements on the old one
+	}
+
+	const bool changed = (rate.lastReceivedMs == 0) || rate.lost || (rate.ddi != ddi) || (rate.value != value);
+	if (rate.lost)
+	{
+		log("Rate") << "Channel " << int(channel) << ": setpoints resumed" << std::endl;
+	}
+	rate.ddi = ddi;
+	rate.value = value;
+	rate.lastReceivedMs = now;
+	rate.lost = false;
+
+	if (changed)
+	{
+		log("Rate") << "Channel " << int(channel) << ": DDI " << ddi << " setpoint " << value << std::endl;
+		send_rate_to_elements(channel, ddi, value);
+		rate.lastSentMs = now;
+	}
+}
+
+void MyTCServer::update_rate_setpoints()
+{
+	std::lock_guard<std::recursive_mutex> lock(clientsMutex);
+	const std::uint32_t now = isobus::SystemTiming::get_timestamp_ms();
+	for (std::uint8_t i = 0; i < MAX_RATE_CHANNELS; i++)
+	{
+		RateChannel &rate = rateChannels[i];
+		const std::uint8_t channel = i + 1;
+		if (rate.lastReceivedMs == 0 || rate.lost)
+		{
+			continue;
+		}
+
+		if (isobus::SystemTiming::time_expired_ms(rate.lastReceivedMs, RATE_TIMEOUT_MS))
+		{
+			// lose the rate source, stop applying: 0 once, then wait for a new setpoint
+			log("Rate") << "Channel " << int(channel) << ": no setpoint for " << RATE_TIMEOUT_MS / 1000 << " s, sending 0" << std::endl;
+			send_rate_to_elements(channel, rate.ddi, 0);
+			rate.lost = true;
+		}
+		else if (isobus::SystemTiming::time_expired_ms(rate.lastSentMs, RATE_RESEND_MS))
+		{
+			// sent continuously, so an element that connects (or reconnects) gets it within a second
+			send_rate_to_elements(channel, rate.ddi, rate.value);
+			rate.lastSentMs = now;
+		}
 	}
 }
 

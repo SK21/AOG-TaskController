@@ -566,7 +566,6 @@ void Application::setup_udp_connections()
 		}
 		else if (pgn == 0xF2 && data.size() >= 6) // Process Data
 		{
-			lastAogPacketMs = isobus::SystemTiming::get_timestamp_ms();
 			auto identifier = static_cast<isobus::DataDescriptionIndex>(data[0] | (data[1] << 8));
 
 			const std::uint32_t rawValue =
@@ -575,7 +574,20 @@ void Application::setup_udp_connections()
 			  (static_cast<std::uint32_t>(data[4]) << 16) |
 			  (static_cast<std::uint32_t>(data[5]) << 24);
 			const std::int32_t value = static_cast<std::int32_t>(rawValue);
-			if (identifier == isobus::DataDescriptionIndex::ActualSpeed)
+			const auto ddi = static_cast<std::uint16_t>(identifier);
+			const bool rateSetpoint = MyTCServer::is_rate_setpoint_ddi(ddi);
+			if (!rateSetpoint)
+			{
+				lastAogPacketMs = isobus::SystemTiming::get_timestamp_ms(); // rate setpoints come from RateController, not AOG
+			}
+
+			if (rateSetpoint)
+			{
+				// [6] = rate channel 1-5 (RateController's product + 1); without it, channel 1
+				const std::uint8_t channel = (data.size() >= 7) ? data[6] : 1;
+				tcServer->update_rate_setpoint(channel, ddi, value);
+			}
+			else if (identifier == isobus::DataDescriptionIndex::ActualSpeed)
 			{
 				lastSpeedValue = value; // Store the full precision value
 				std::uint16_t speed = std::abs(value);
@@ -681,6 +693,7 @@ bool Application::update()
 	udpConnections->handle_incoming_packets();
 
 	tcServer->request_measurement_commands();
+	tcServer->update_rate_setpoints();
 	warn_if_late("tcServer->update()", lastTcServerUpdateCallMs, 200);
 	tcServer->update();
 	if (tcFunctionalities)

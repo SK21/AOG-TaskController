@@ -96,7 +96,7 @@ All PGNs sent **by AgIO/AgValonia to the TC** use source `0x7F`, except `0xD6` (
 | `0xD6` (214) | GPS/IMU data | variable (≥39 used) | Only byte 38 (fix quality) is parsed today; rest of frame is currently unused. Source `0x7C`. |
 | `0xE5` (229) | Section states (64 sections) | 8 | Bitfield: bit `8·j + i` of byte `j` is section `(8j + i)` ON/OFF |
 | `0xF1` (241) | Section control mode | 1 | `[mode]` where `1` = enabled, `0` = disabled |
-| `0xF2` (242) | Process data | 6 | `[DDI_lo, DDI_hi, val0, val1, val2, val3]` — DDI is little-endian `uint16`; value is little-endian `int32` |
+| `0xF2` (242) | Process data | 6 or 7 | `[DDI_lo, DDI_hi, val0, val1, val2, val3]` — DDI is little-endian `uint16`; value is little-endian `int32`. Rate setpoints add `[channel]` (see below) |
 
 #### `0xC9` — Subnet detection
 
@@ -137,6 +137,13 @@ Wraps a single ISO 11783 DDI/value pair. The TC currently dispatches on these DD
 | `156` | Actual speed (mm/s) | Stored. If TECU enabled, broadcast as Ground/Wheel/Machine-selected speed (PGN 65256) + NMEA2000 SOG. Drives forward/reverse direction. Also produces J1939 PGN 65256 every 100 ms. |
 | `597` | Total distance (mm) | Stored and displayed on the VT Status page. If TECU is enabled, also populated into Speed Messages distance fields. |
 | Guidance line deviation | XTE (mm) | Converted to metres. Broadcast as NMEA2000 XTE (PGN 0x1F903) at 1 Hz. |
+| `1`, `6`, `11` | Setpoint volume (mm³/m²), mass (mg/m²) or count (/m²) per area application rate | Rate setpoint for a rate channel (see below). Not counted as AOG traffic. |
+
+**Rate setpoints (DDI 1/6/11).** Sent by RateController, one message per product, in the DDI's ISO unit (e.g. 1 L/ha = 100 mm³/m² = DDI 1 value `10000` at 0.01 mm³/m² per bit). An optional 7th byte is the **rate channel**, `1`–`5` (RateController's product + 1); without it, channel 1. Other channel numbers are ignored.
+
+- When a DDOP is activated, the TC lists every element with a settable DDI 1, 6 or 11 (log tag `[Rate]`). **Interim:** until channels can be assigned per element, every rate element is on channel 1; channels 2–5 reach no element.
+- A setpoint is sent to each element of its channel that has the same DDI, as a value command, when it changes and then every 1 s, so an element that connects later gets it within a second. Negative values are sent as 0.
+- **Loss of setpoints:** if a channel gets nothing for 4 s, the TC sends 0 to its elements once and waits for a new setpoint. The sender must therefore send continuously (RateController sends every second), not only on change.
 
 Unknown DDIs are silently ignored (PGN 0xF2 is the generic process-data channel — the TC will gain more DDIs over time).
 

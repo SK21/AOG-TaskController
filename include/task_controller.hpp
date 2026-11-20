@@ -15,11 +15,13 @@
 #include "isobus/isobus/isobus_standard_data_description_indices.hpp"
 #include "isobus/isobus/isobus_task_controller_server.hpp"
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <vector>
 
 constexpr std::uint8_t NUMBER_SECTIONS_PER_CONDENSED_MESSAGE = 16;
 
@@ -29,6 +31,14 @@ enum SectionState : std::uint8_t
 	ON = 1, ///< Section is on
 	ERROR_SATE = 2, ///< Section is in an error state
 	NOT_INSTALLED = 3 ///< Section is not installed
+};
+
+/// @brief An implement element that takes a rate setpoint, and the rate channel that drives it
+struct RateElement
+{
+	std::uint16_t ddi; ///< Settable rate DDI: 1 volume, 6 mass or 11 count per area
+	std::uint16_t elementNumber; ///< The element the DDI belongs to
+	std::uint8_t channel; ///< Rate channel (1 = RateController product 1)
 };
 
 class ClientState
@@ -70,6 +80,9 @@ public:
 	// Element work state management these act like master / override for actual sections
 	void set_element_work_state(std::uint16_t elementNumber, bool isWorking);
 	bool try_get_element_work_state(std::uint16_t elementNumber, bool &isWorking) const;
+	void clear_rate_elements();
+	void add_rate_element(const RateElement &element);
+	const std::vector<RateElement> &get_rate_elements() const;
 
 private:
 	isobus::DeviceDescriptorObjectPool pool; ///< The device descriptor object pool (DDOP) for the TC
@@ -89,6 +102,7 @@ private:
 	bool isSectionControlEnabled = false; ///< Stores auto vs manual mode setting
 	bool usesPerElementControl = false; ///< Legacy mode: use per-element setpoint instead of condensed
 	std::uint16_t perElementSetpointDDI = 0; ///< The DDI to use for per-element setpoints (289 or 141), 0 if not applicable
+	std::vector<RateElement> rateElements; ///< Elements with a settable rate DDI (an element may appear more than once)
 };
 
 // Create the task controller server object, this will handle all the ISOBUS communication for us
@@ -135,7 +149,36 @@ public:
 	/// @param quality NMEA 2000 GNSS Method: 0=No GNSS, 1=GNSS, 2=DGNSS, 3=Precise, 4=RTK Fixed, 5=RTK Float, 6=Estimated, 7=Manual, 8=Simulated
 	void send_gnss_quality(std::uint8_t quality);
 
+	static constexpr std::uint8_t MAX_RATE_CHANNELS = 5; ///< RateController's rate products
+
+	/// @brief True for the rate setpoint DDIs a rate channel can carry: 1 (volume), 6 (mass), 11 (count) per area
+	static bool is_rate_setpoint_ddi(std::uint16_t ddi);
+
+	/// @brief Stores a rate setpoint from RateController (PGN 0xF2) and sends it to the channel's elements when it changed
+	/// @param channel Rate channel 1 to MAX_RATE_CHANNELS (RateController's product + 1); others are ignored
+	/// @param ddi The rate setpoint DDI (see is_rate_setpoint_ddi), in that DDI's ISO unit
+	/// @param value The setpoint; negative values are sent as 0
+	void update_rate_setpoint(std::uint8_t channel, std::uint16_t ddi, std::int32_t value);
+
+	/// @brief Call every update: resends each channel's setpoint every RATE_RESEND_MS, and sends 0 once
+	/// when a channel has had no setpoint for RATE_TIMEOUT_MS (lose the rate source, stop applying)
+	void update_rate_setpoints();
+
 private:
+	struct RateChannel
+	{
+		std::uint16_t ddi = 0; ///< DDI of the last setpoint, 0 = never received
+		std::int32_t value = 0; ///< Last setpoint
+		std::uint32_t lastReceivedMs = 0; ///< When the last setpoint arrived
+		std::uint32_t lastSentMs = 0; ///< When it was last sent to the elements
+		bool lost = false; ///< Timed out and set to 0; waits for a new setpoint
+	};
+	static constexpr std::uint32_t RATE_RESEND_MS = 1000;
+	static constexpr std::uint32_t RATE_TIMEOUT_MS = 4000;
+
+	/// @brief Sends a value to every element on the channel that uses the given DDI. Caller must hold clientsMutex.
+	void send_rate_to_elements(std::uint8_t channel, std::uint16_t ddi, std::int32_t value);
+
 	/// @brief Sends every condensed setpoint block and DDI 289, even when unchanged (ISO 11783-10 F.3.5.3 b)
 	void send_all_section_setpoint_states(std::shared_ptr<isobus::ControlFunction> client);
 	void send_section_setpoint_states(std::shared_ptr<isobus::ControlFunction> client, std::uint8_t ddiOffset, bool forceWorkState = false);
@@ -152,6 +195,7 @@ private:
 	static constexpr std::uint32_t SECTION_DEMAND_TIMEOUT_MS = 2000; ///< AOG sends PGN 229 every frame while a field is open
 	std::vector<bool> aogSectionDemand; ///< Last section states from AOG (PGN 229). Guarded by clientsMutex
 	std::uint32_t lastSectionDemandMs = 0; ///< When AOG's section demand was last received, 0 = never. Guarded by clientsMutex
+	std::array<RateChannel, MAX_RATE_CHANNELS> rateChannels; ///< Rate setpoints from RateController, index = channel - 1. Guarded by clientsMutex
 
 	/// @brief Guards clients and uploadedPools.
 	///
