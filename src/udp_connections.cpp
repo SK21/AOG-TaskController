@@ -171,6 +171,7 @@ void UdpConnections::handle_incoming_packets()
 	{
 		rxIndex += bytesReceived;
 		std::uint8_t index = 0;
+		lastSender = sender_endpoint; // for replies from the packet callback (get_last_sender)
 
 		while (rxIndex >= 8)
 		{
@@ -341,4 +342,37 @@ bool UdpConnections::send(std::uint8_t src, std::uint8_t pgn, std::span<std::uin
 		return false;
 	}
 	return true;
+}
+
+std::size_t UdpConnections::build_packet(std::array<std::uint8_t, 512> &txBuffer, std::uint8_t src, std::uint8_t pgn, std::span<std::uint8_t> data)
+{
+	std::size_t index = 0;
+	txBuffer[index++] = PACKET_START >> 8;
+	txBuffer[index++] = PACKET_START & 0xFF;
+	txBuffer[index++] = src;
+	txBuffer[index++] = pgn;
+	txBuffer[index++] = static_cast<std::uint8_t>(data.size());
+	std::copy(data.begin(), data.end(), txBuffer.begin() + index);
+	index += data.size();
+	txBuffer[index] = calculate_crc({ txBuffer.data() + 2, index - 2 });
+	return index + 1;
+}
+
+bool UdpConnections::send_to(const udp::endpoint &endpoint, std::uint8_t src, std::uint8_t pgn, std::span<std::uint8_t> data)
+{
+	bool result = true;
+	std::array<std::uint8_t, 512> txBuffer;
+	const std::size_t length = build_packet(txBuffer, src, pgn, data);
+	boost::system::error_code errorCode;
+	udpConnection.send_to(boost::asio::buffer(txBuffer, length), endpoint, 0, errorCode);
+	if (errorCode)
+	{
+		result = false; // e.g. the receiver has gone; the caller sends again later
+	}
+	return result;
+}
+
+udp::endpoint UdpConnections::get_last_sender() const
+{
+	return lastSender;
 }

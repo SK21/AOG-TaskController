@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <array>
 #include <boost/asio.hpp>
 #include <span>
 #include "settings.hpp"
@@ -70,6 +71,22 @@ public:
 	bool send(std::uint8_t src, std::uint8_t pgn, std::span<std::uint8_t> data);
 
 	/**
+	 * @brief Send a packet to one endpoint instead of the broadcast (e.g. a reply to RateController)
+	 * @param endpoint Where to send it
+	 * @param src The source of the packet
+	 * @param pgn The PGN of the packet
+	 * @param data The data of the packet
+	 * @return True if the packet was sent successfully, false otherwise
+	 */
+	bool send_to(const udp::endpoint &endpoint, std::uint8_t src, std::uint8_t pgn, std::span<std::uint8_t> data);
+
+	/**
+	 * @brief The sender of the packet being handled (valid inside the packet callback)
+	 * @return The sender's address and port
+	 */
+	udp::endpoint get_last_sender() const;
+
+	/**
 	 * @brief Get the IPv4 address used by the AOG UDP connection
 	 * @return The bound address, or "not available" if the socket is not open
 	 */
@@ -92,7 +109,11 @@ private:
       */
 	std::uint8_t calculate_crc(std::span<std::uint8_t> data);
 
+	/// @brief Builds a framed packet into txBuffer, returns its length
+	std::size_t build_packet(std::array<std::uint8_t, 512> &txBuffer, std::uint8_t src, std::uint8_t pgn, std::span<std::uint8_t> data);
+
 	PacketCallback packetCallback = nullptr;
+	udp::endpoint lastSender; ///< Sender of the packet being handled by handle_incoming_packets
 	std::shared_ptr<Settings> settings;
 	udp::socket udpConnection;
 	udp::socket udpConnectionAddressDetection;

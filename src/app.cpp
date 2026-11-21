@@ -550,6 +550,13 @@ void Application::setup_udp_connections()
 			const std::uint16_t ddi = static_cast<std::uint16_t>(data[1] | (data[2] << 8));
 			const std::string name(data.begin() + 3, data.end());
 			tcServer->update_rate_channel_info(data[0], ddi, name);
+
+			const udp::endpoint sender = udpConnections->get_last_sender();
+			if (!rateControllerEndpoint || *rateControllerEndpoint != sender)
+			{
+				log("Rate") << "RateController at " << sender.address().to_string() << ":" << sender.port() << ", actuals (PGN 0xF5) go there" << std::endl;
+				rateControllerEndpoint = sender;
+			}
 		}
 		else if (pgn == 0xF3) // 243 - Field name, empty when the field is closed
 		{
@@ -711,6 +718,7 @@ bool Application::update()
 	{
 		send_hardware_message(rateMessage, 5, HW_MSG_INFO);
 	}
+	send_rate_actuals();
 	warn_if_late("tcServer->update()", lastTcServerUpdateCallMs, 200);
 	tcServer->update();
 	if (tcFunctionalities)
@@ -913,6 +921,37 @@ bool Application::update()
 	}
 
 	return true;
+}
+
+void Application::send_rate_actuals()
+{
+	// PGN 0xF5 to RateController, per channel with matched elements (and once after it loses them):
+	// [channel][actual DDI lo, hi][rate int32][total DDI lo, hi][total int32][elements][flags]
+	if (rateControllerEndpoint && isobus::SystemTiming::time_expired_ms(lastRateActualsMs, 1000))
+	{
+		lastRateActualsMs = isobus::SystemTiming::get_timestamp_ms();
+		for (const auto &actuals : tcServer->get_rate_channel_actuals())
+		{
+			std::array<std::uint8_t, 15> payload = {
+				actuals.channel,
+				static_cast<std::uint8_t>(actuals.actualDdi & 0xFF),
+				static_cast<std::uint8_t>(actuals.actualDdi >> 8),
+				static_cast<std::uint8_t>(actuals.rate & 0xFF),
+				static_cast<std::uint8_t>((actuals.rate >> 8) & 0xFF),
+				static_cast<std::uint8_t>((actuals.rate >> 16) & 0xFF),
+				static_cast<std::uint8_t>((actuals.rate >> 24) & 0xFF),
+				static_cast<std::uint8_t>(actuals.totalDdi & 0xFF),
+				static_cast<std::uint8_t>(actuals.totalDdi >> 8),
+				static_cast<std::uint8_t>(actuals.total & 0xFF),
+				static_cast<std::uint8_t>((actuals.total >> 8) & 0xFF),
+				static_cast<std::uint8_t>((actuals.total >> 16) & 0xFF),
+				static_cast<std::uint8_t>((actuals.total >> 24) & 0xFF),
+				actuals.elements,
+				actuals.flags
+			};
+			udpConnections->send_to(*rateControllerEndpoint, 0x80, 0xF5, payload);
+		}
+	}
 }
 
 void Application::send_hardware_message(const std::string &text, std::uint8_t duration, std::uint8_t color)

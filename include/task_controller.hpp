@@ -41,6 +41,27 @@ struct RateElement
 	std::uint16_t elementNumber; ///< The element the DDI belongs to
 	std::uint8_t channel; ///< Rate channel (1 = RateController product 1), 0 = not matched to a channel
 	std::string designator; ///< The element's DDOP designator, for the log
+	std::uint16_t actualDdi = 0; ///< Its actual rate DDI (2, 7 or 12) when the DDOP declares it, else 0
+	std::uint16_t totalDdi = 0; ///< An application total of the same kind (80/81/82/351/352) on it or a parent, else 0
+	std::uint16_t totalElement = 0; ///< The element the total belongs to (may be a parent, shared by several rate elements)
+	std::int32_t actualValue = 0; ///< Last actual rate from the implement, raw
+	std::uint32_t actualMs = 0; ///< When it arrived, 0 = never
+	std::int32_t totalValue = 0; ///< Last total from the implement, raw
+	std::uint32_t totalMs = 0; ///< When it arrived, 0 = never
+	bool pollActual = false; ///< The implement offers no time-interval or on-change trigger: request it every second
+	bool pollTotal = false; ///< As pollActual, for the total
+};
+
+/// @brief What one rate channel's elements report, for RateController (PGN 0xF5)
+struct RateChannelActuals
+{
+	std::uint8_t channel = 0; ///< 1 to 5
+	std::uint16_t actualDdi = 0; ///< 2, 7 or 12
+	std::int32_t rate = 0; ///< Mean of the elements' actual rates, raw in actualDdi's unit
+	std::uint16_t totalDdi = 0; ///< 351 (mL), 352 (g) or 82 (count); 0 = no total
+	std::int32_t total = 0; ///< Sum of the elements' totals (a parent's total counted once), in totalDdi's unit
+	std::uint8_t elements = 0; ///< Elements matched to the channel
+	std::uint8_t flags = 0; ///< bit 0 rate valid, bit 1 total valid
 };
 
 class ClientState
@@ -85,7 +106,10 @@ public:
 	void clear_rate_elements();
 	void add_rate_element(const RateElement &element);
 	const std::vector<RateElement> &get_rate_elements() const;
+	std::vector<RateElement> &get_rate_elements_mutable();
 	void set_rate_element_channel(std::size_t index, std::uint8_t channel);
+	/// @brief Stores an actual rate or total the implement reported for one of the rate elements
+	void store_rate_value(std::uint16_t elementNumber, std::uint16_t ddi, std::int32_t value, std::uint32_t nowMs);
 
 private:
 	isobus::DeviceDescriptorObjectPool pool; ///< The device descriptor object pool (DDOP) for the TC
@@ -176,6 +200,11 @@ public:
 	/// @brief Returns (and clears) the element-to-channel changes since the last call, for AOG's hardware message
 	std::vector<std::string> take_rate_messages();
 
+	/// @brief Each channel's actual rate and total from its elements, for PGN 0xF5. Includes, once, a channel
+	/// that just lost its elements (elements 0, flags 0). Call about once a second; also requests totals that
+	/// the implement only sends on request.
+	std::vector<RateChannelActuals> get_rate_channel_actuals();
+
 private:
 	struct RateChannel
 	{
@@ -221,6 +250,11 @@ private:
 	std::uint32_t lastSectionDemandMs = 0; ///< When AOG's section demand was last received, 0 = never. Guarded by clientsMutex
 	std::array<RateChannel, MAX_RATE_CHANNELS> rateChannels; ///< Rate setpoints from RateController, index = channel - 1. Guarded by clientsMutex
 	std::vector<std::string> pendingRateMessages; ///< Element-to-channel changes for AOG's hardware message. Guarded by clientsMutex
+	std::array<bool, MAX_RATE_CHANNELS> actualsReported{}; ///< Channel had elements at the last get_rate_channel_actuals. Guarded by clientsMutex
+	static constexpr std::uint32_t RATE_ACTUAL_FRESH_MS = 3000; ///< An element's actual or total older than this isn't used
+
+	/// @brief Finds the element's actual rate DDI and a total, and asks the implement to send them. Caller must hold clientsMutex.
+	void subscribe_rate_actuals(std::shared_ptr<isobus::ControlFunction> client, ClientState &state, RateElement &element);
 
 	/// @brief Guards clients and uploadedPools.
 	///

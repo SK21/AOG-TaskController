@@ -92,6 +92,46 @@ static std::string element_designator(isobus::DeviceDescriptorObjectPool &pool, 
 	return result;
 }
 
+// The device element with the given element number, nullptr when there is none.
+static std::shared_ptr<isobus::task_controller_object::DeviceElementObject> element_by_number(isobus::DeviceDescriptorObjectPool &pool, std::uint16_t elementNumber)
+{
+	std::shared_ptr<isobus::task_controller_object::DeviceElementObject> result;
+	for (std::uint32_t i = 0; i < pool.size() && !result; i++)
+	{
+		auto object = pool.get_object_by_index(i);
+		if (object && object->get_object_type() == isobus::task_controller_object::ObjectTypes::DeviceElement)
+		{
+			auto elementObject = std::dynamic_pointer_cast<isobus::task_controller_object::DeviceElementObject>(object);
+			if (elementObject && elementObject->get_element_number() == elementNumber)
+			{
+				result = elementObject;
+			}
+		}
+	}
+	return result;
+}
+
+// The process data object with the given DDI among the element's children, nullptr when there is none.
+static std::shared_ptr<isobus::task_controller_object::DeviceProcessDataObject> child_process_data(isobus::DeviceDescriptorObjectPool &pool,
+                                                                                                     const isobus::task_controller_object::DeviceElementObject &element,
+                                                                                                     std::uint16_t ddi)
+{
+	std::shared_ptr<isobus::task_controller_object::DeviceProcessDataObject> result;
+	for (std::uint16_t childId : element.get_child_object_ids())
+	{
+		auto object = pool.get_object_by_id(childId);
+		if (!result && object && object->get_object_type() == isobus::task_controller_object::ObjectTypes::DeviceProcessData)
+		{
+			auto processData = std::dynamic_pointer_cast<isobus::task_controller_object::DeviceProcessDataObject>(object);
+			if (processData && processData->get_ddi() == ddi)
+			{
+				result = processData;
+			}
+		}
+	}
+	return result;
+}
+
 // Logs and keeps the DDOP bytes exactly as received, so pools from different sessions can be compared byte for byte.
 // Files are named by hash, so each distinct pool is written once. Never affects activation.
 static void save_received_ddop(std::uint64_t clientName, const std::vector<std::uint8_t> &rawPool, const std::vector<std::size_t> &chunkSizes)
@@ -388,6 +428,28 @@ void ClientState::set_rate_element_channel(std::size_t index, std::uint8_t chann
 	if (index < rateElements.size())
 	{
 		rateElements[index].channel = channel;
+	}
+}
+
+std::vector<RateElement> &ClientState::get_rate_elements_mutable()
+{
+	return rateElements;
+}
+
+void ClientState::store_rate_value(std::uint16_t elementNumber, std::uint16_t ddi, std::int32_t value, std::uint32_t nowMs)
+{
+	for (auto &element : rateElements)
+	{
+		if (element.actualDdi == ddi && element.elementNumber == elementNumber)
+		{
+			element.actualValue = value;
+			element.actualMs = nowMs;
+		}
+		if (element.totalDdi == ddi && element.totalElement == elementNumber)
+		{
+			element.totalValue = value; // a parent's total is kept by every rate element under it
+			element.totalMs = nowMs;
+		}
 	}
 }
 
@@ -779,6 +841,9 @@ bool MyTCServer::on_value_command(std::shared_ptr<isobus::ControlFunction> partn
 		}
 	}
 
+	// actual rates and totals of the rate elements, for RateController (PGN 0xF5)
+	clients[partner].store_rate_value(elementNumber, dataDescriptionIndex, processDataValue, std::max<std::uint32_t>(isobus::SystemTiming::get_timestamp_ms(), 1));
+
 	return true;
 }
 
@@ -965,6 +1030,10 @@ void MyTCServer::request_measurement_commands()
 					log("Rate") << "Rate element " << elementNumber << " \"" << designator << "\": DDI " << processDataObject->get_ddi()
 					            << " (" << entry.to_string() << ")" << std::endl;
 				}
+			}
+			for (auto &element : client.second.get_rate_elements_mutable())
+			{
+				subscribe_rate_actuals(client.first, client.second, element);
 			}
 			match_rate_elements(client.first, client.second, true);
 
@@ -1246,6 +1315,177 @@ std::vector<std::string> MyTCServer::take_rate_messages()
 	std::lock_guard<std::recursive_mutex> lock(clientsMutex);
 	std::vector<std::string> result;
 	result.swap(pendingRateMessages);
+	return result;
+}
+
+void MyTCServer::subscribe_rate_actuals(std::shared_ptr<isobus::ControlFunction> client, ClientState &state, RateElement &element)
+{
+	using Trigger = isobus::task_controller_object::DeviceProcessDataObject::AvailableTriggerMethods;
+	auto &pool = state.get_pool();
+
+	// time interval 1 s if offered, else on change, else the caller requests it every second
+	auto subscribe = [&](isobus::task_controller_object::DeviceProcessDataObject &processData, std::uint16_t elementNumber, bool &poll) -> std::string {
+		std::string how;
+		if (processData.has_trigger_method(Trigger::TimeInterval))
+		{
+			send_time_interval_measurement_command(client, processData.get_ddi(), elementNumber, 1000);
+			how = "every 1 s";
+		}
+		else if (processData.has_trigger_method(Trigger::OnChange))
+		{
+			send_change_threshold_measurement_command(client, processData.get_ddi(), elementNumber, 1);
+			how = "on change";
+		}
+		else
+		{
+			poll = true;
+			how = "requested every 1 s";
+		}
+		return how;
+	};
+
+	std::string actualText = "no actual rate";
+	auto rateElement = element_by_number(pool, element.elementNumber);
+	if (rateElement)
+	{
+		auto actual = child_process_data(pool, *rateElement, element.ddi + 1); // 1 -> 2, 6 -> 7, 11 -> 12
+		if (actual)
+		{
+			element.actualDdi = actual->get_ddi();
+			actualText = "actual DDI " + std::to_string(element.actualDdi) + " " + subscribe(*actual, element.elementNumber, element.pollActual);
+		}
+	}
+
+	// a total of the same kind, the finer one first, on the element or the nearest parent that has one
+	std::vector<std::uint16_t> totalDdis;
+	if (element.ddi == static_cast<std::uint16_t>(isobus::DataDescriptionIndex::SetpointVolumePerAreaApplicationRate))
+	{
+		totalDdis = { static_cast<std::uint16_t>(isobus::DataDescriptionIndex::ApplicationTotalVolume_ml), static_cast<std::uint16_t>(isobus::DataDescriptionIndex::ApplicationTotalVolume_L) };
+	}
+	else if (element.ddi == static_cast<std::uint16_t>(isobus::DataDescriptionIndex::SetpointMassPerAreaApplicationRate))
+	{
+		totalDdis = { static_cast<std::uint16_t>(isobus::DataDescriptionIndex::ApplicationTotalMassGram_g), static_cast<std::uint16_t>(isobus::DataDescriptionIndex::ApplicationTotalMass_kg) };
+	}
+	else
+	{
+		totalDdis = { static_cast<std::uint16_t>(isobus::DataDescriptionIndex::ApplicationTotalCount) };
+	}
+
+	std::string totalText = "no total";
+	auto level = rateElement;
+	for (int depth = 0; level && element.totalDdi == 0 && depth < 8; depth++)
+	{
+		for (std::uint16_t ddi : totalDdis)
+		{
+			auto total = (element.totalDdi == 0) ? child_process_data(pool, *level, ddi) : nullptr;
+			if (total)
+			{
+				element.totalDdi = ddi;
+				element.totalElement = level->get_element_number();
+				totalText = "total DDI " + std::to_string(ddi) + " on element " + std::to_string(element.totalElement) + " " + subscribe(*total, element.totalElement, element.pollTotal);
+			}
+		}
+
+		// up to the parent element (the device's parent is not an element)
+		auto parent = pool.get_object_by_id(level->get_parent_object());
+		level = (parent && parent->get_object_type() == isobus::task_controller_object::ObjectTypes::DeviceElement && parent != level) ?
+		  std::dynamic_pointer_cast<isobus::task_controller_object::DeviceElementObject>(parent) :
+		  nullptr;
+	}
+
+	log("Rate") << "Element " << element.elementNumber << " \"" << element.designator << "\": " << actualText << ", " << totalText << std::endl;
+}
+
+std::vector<RateChannelActuals> MyTCServer::get_rate_channel_actuals()
+{
+	std::lock_guard<std::recursive_mutex> lock(clientsMutex);
+	const std::uint32_t now = isobus::SystemTiming::get_timestamp_ms();
+	std::vector<RateChannelActuals> result;
+
+	for (std::uint8_t channel = 1; channel <= MAX_RATE_CHANNELS; channel++)
+	{
+		RateChannelActuals actuals;
+		actuals.channel = channel;
+		std::int64_t rateSum = 0;
+		std::uint8_t rateCount = 0;
+		std::int64_t totalSum = 0;
+		bool totalSeen = false;
+		std::vector<std::pair<isobus::ControlFunction *, std::uint32_t>> totalsCounted; // a parent's total once
+
+		for (auto &client : clients)
+		{
+			for (auto &element : client.second.get_rate_elements_mutable())
+			{
+				if (element.channel != channel)
+				{
+					continue;
+				}
+				actuals.elements++;
+
+				// values the implement only sends on request
+				if (element.pollActual)
+				{
+					send_request_value(client.first, element.actualDdi, element.elementNumber);
+				}
+				if (element.pollTotal)
+				{
+					send_request_value(client.first, element.totalDdi, element.totalElement);
+				}
+
+				if (element.actualDdi != 0 && element.actualMs != 0 && !isobus::SystemTiming::time_expired_ms(element.actualMs, RATE_ACTUAL_FRESH_MS))
+				{
+					actuals.actualDdi = element.actualDdi;
+					rateSum += element.actualValue;
+					rateCount++;
+				}
+
+				const std::pair<isobus::ControlFunction *, std::uint32_t> totalKey(client.first.get(), (static_cast<std::uint32_t>(element.totalElement) << 16) | element.totalDdi);
+				if (element.totalDdi != 0 && element.totalMs != 0 && !isobus::SystemTiming::time_expired_ms(element.totalMs, RATE_ACTUAL_FRESH_MS) &&
+				    std::find(totalsCounted.begin(), totalsCounted.end(), totalKey) == totalsCounted.end())
+				{
+					totalsCounted.push_back(totalKey);
+					// in mL, g or count: DDI 80 (L) and 81 (kg) x 1000
+					std::int64_t value = element.totalValue;
+					std::uint16_t fineDdi = element.totalDdi;
+					if (element.totalDdi == static_cast<std::uint16_t>(isobus::DataDescriptionIndex::ApplicationTotalVolume_L))
+					{
+						value *= 1000;
+						fineDdi = static_cast<std::uint16_t>(isobus::DataDescriptionIndex::ApplicationTotalVolume_ml);
+					}
+					else if (element.totalDdi == static_cast<std::uint16_t>(isobus::DataDescriptionIndex::ApplicationTotalMass_kg))
+					{
+						value *= 1000;
+						fineDdi = static_cast<std::uint16_t>(isobus::DataDescriptionIndex::ApplicationTotalMassGram_g);
+					}
+					actuals.totalDdi = fineDdi;
+					totalSum += value;
+					totalSeen = true;
+				}
+			}
+		}
+
+		if (rateCount > 0)
+		{
+			actuals.rate = static_cast<std::int32_t>(rateSum / rateCount);
+			actuals.flags |= 0x01;
+		}
+		if (totalSeen)
+		{
+			actuals.total = static_cast<std::int32_t>(std::min<std::int64_t>(totalSum, INT32_MAX));
+			actuals.flags |= 0x02;
+		}
+
+		const bool hasElements = actuals.elements > 0;
+		if (hasElements || actualsReported[channel - 1])
+		{
+			result.push_back(actuals); // one more with no elements after a channel loses them
+		}
+		if (hasElements != actualsReported[channel - 1])
+		{
+			log("Rate") << "Channel " << int(channel) << ": " << (hasElements ? "reporting actuals to RateController" : "no elements, actuals stopped") << std::endl;
+		}
+		actualsReported[channel - 1] = hasElements;
+	}
 	return result;
 }
 

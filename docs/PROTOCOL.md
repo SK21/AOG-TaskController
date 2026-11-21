@@ -170,6 +170,23 @@ All PGNs sent **by the TC to AgIO/AgValonia** use source `0x80`.
 |---|---|---|---|---|
 | `0xDD` (221) | Hardware message | 2 + T | On event | `[duration, colour, text0, text1, ...]` — `T` = UTF-8 text bytes |
 | `0xF0` (240) | Section heartbeat / state | 2 + ⌈N/8⌉ | 100 ms | `[mode, num_sections, byte0, byte1, ...]` |
+| `0xF5` (245) | Rate channel actuals, to RateController | 15 | 1 s per channel | See "Rate channel actuals" below. Sent to RateController's address, not broadcast |
+
+#### `0xF5` — Rate channel actuals
+
+What the implement reports for each RateController rate channel (see `0xF4`), so RateController records the applied rate and quantity rather than its target. Sent every second for each channel with matched elements, and once more (elements `0`, flags `0`) after a channel loses them. Sent **to the address and port the last `0xF4` came from** (RateController's own socket), not to the `.255:9999` broadcast.
+
+| Byte | Field | Notes |
+|---|---|---|
+| 0 | Channel | `1`–`5` |
+| 1–2 | Actual rate DDI | `2` volume, `7` mass, `12` count per area (the setpoint DDI + 1) |
+| 3–6 | Rate | `int32`, raw in that DDI's unit: mean of the channel's elements that reported in the last 3 s |
+| 7–8 | Total DDI | `351` (mL), `352` (g) or `82` (count); `0` = no total |
+| 9–12 | Total | `int32`: sum of the elements' application totals in that unit (a total on a shared parent element counted once; DDI 80 (L) and 81 (kg) are converted to mL and g) |
+| 13 | Elements | Elements matched to the channel |
+| 14 | Flags | bit 0 rate valid, bit 1 total valid |
+
+**Subscriptions.** For each rate element the TC looks for its actual rate DDI (on the element) and an application total of the same kind (DDI 351 or 80 for volume, 352 or 81 for mass, 82 for count; on the element, else the nearest parent element that has one). Each is asked for every 1 s by time-interval measurement command if the DDOP offers that trigger, else on change, else the TC requests the value every second. Each element's result is logged (`[Rate] Element 20 "Rate 1": actual DDI 2 every 1 s, total DDI 351 on element 20 every 1 s`).
 
 #### `0xDD` — Hardware message
 

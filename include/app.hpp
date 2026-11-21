@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -119,6 +120,11 @@ private:
 	static constexpr std::uint32_t GNSS_QUALITY_TIMEOUT_MS = 2000; ///< No PGN 0xD6 for this long = fix quality unknown
 	std::uint32_t lastDistanceMm = 0;
 	std::uint32_t lastAogPacketMs = 0;
+	std::optional<udp::endpoint> rateControllerEndpoint; ///< Where RateController's channel info (PGN 0xF4) came from: actuals (0xF5) go back there
+	std::uint32_t lastRateActualsMs = 0; ///< When PGN 0xF5 was last sent
+
+	/// @brief Sends each rate channel's actual rate and total to RateController (PGN 0xF5), once a second
+	void send_rate_actuals();
 
 	/// @brief AOG opened a field: switch section control on, as if AOG's SC button was pressed (if enabled in settings)
 	/// @param how What showed the field opening, for the log
