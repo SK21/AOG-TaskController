@@ -73,6 +73,25 @@ static bool find_owning_element_number(isobus::DeviceDescriptorObjectPool &pool,
 	return false;
 }
 
+// The designator of the device element with the given number, "" when there is none.
+static std::string element_designator(isobus::DeviceDescriptorObjectPool &pool, std::uint16_t elementNumber)
+{
+	std::string result;
+	for (std::uint32_t i = 0; i < pool.size() && result.empty(); i++)
+	{
+		auto object = pool.get_object_by_index(i);
+		if (object && object->get_object_type() == isobus::task_controller_object::ObjectTypes::DeviceElement)
+		{
+			auto elementObject = std::dynamic_pointer_cast<isobus::task_controller_object::DeviceElementObject>(object);
+			if (elementObject && elementObject->get_element_number() == elementNumber)
+			{
+				result = elementObject->get_designator();
+			}
+		}
+	}
+	return result;
+}
+
 // Logs and keeps the DDOP bytes exactly as received, so pools from different sessions can be compared byte for byte.
 // Files are named by hash, so each distinct pool is written once. Never affects activation.
 static void save_received_ddop(std::uint64_t clientName, const std::vector<std::uint8_t> &rawPool, const std::vector<std::size_t> &chunkSizes)
@@ -362,6 +381,14 @@ void ClientState::add_rate_element(const RateElement &element)
 const std::vector<RateElement> &ClientState::get_rate_elements() const
 {
 	return rateElements;
+}
+
+void ClientState::set_rate_element_channel(std::size_t index, std::uint8_t channel)
+{
+	if (index < rateElements.size())
+	{
+		rateElements[index].channel = channel;
+	}
 }
 
 MyTCServer::MyTCServer(std::shared_ptr<isobus::InternalControlFunction> internalControlFunction,
@@ -906,8 +933,8 @@ void MyTCServer::request_measurement_commands()
 				}
 			}
 
-			// Map the settable rate DDIs (1/6/11) so update_rate_setpoint() knows which elements to address.
-			// Interim until channels can be assigned per element: every rate element is on channel 1.
+			// List the settable rate DDIs (1/6/11); match_rate_elements() puts each on the channel of the same type.
+			// Interim until channels can be assigned per element (Group2_Step1_Channels_Design.md, RateController).
 			client.second.clear_rate_elements();
 			for (std::uint32_t i = 0; i < client.second.get_pool().size(); i++)
 			{
@@ -933,11 +960,13 @@ void MyTCServer::request_measurement_commands()
 				std::uint16_t elementNumber = 0;
 				if (find_owning_element_number(client.second.get_pool(), *processDataObject, elementNumber))
 				{
-					client.second.add_rate_element({ processDataObject->get_ddi(), elementNumber, 1 });
-					log("Rate") << "Mapped DDI " << processDataObject->get_ddi() << " (" << entry.to_string() << ") on element "
-					            << elementNumber << " to rate channel 1 (interim: channel 1 drives every rate element)" << std::endl;
+					const std::string designator = element_designator(client.second.get_pool(), elementNumber);
+					client.second.add_rate_element({ processDataObject->get_ddi(), elementNumber, 0, designator });
+					log("Rate") << "Rate element " << elementNumber << " \"" << designator << "\": DDI " << processDataObject->get_ddi()
+					            << " (" << entry.to_string() << ")" << std::endl;
 				}
 			}
+			match_rate_elements(client.first, client.second, true);
 
 			log() << "Measurement commands sent." << std::endl;
 			client.second.mark_measurement_commands_sent();
@@ -1112,10 +1141,16 @@ void MyTCServer::update_rate_setpoint(std::uint8_t channel, std::uint16_t ddi, s
 	{
 		log("Rate") << "Channel " << int(channel) << ": setpoints resumed" << std::endl;
 	}
+	const bool typeChanged = !rate.infoReceived && rate.ddi != ddi; // without channel info the setpoints give the type
 	rate.ddi = ddi;
 	rate.value = value;
 	rate.lastReceivedMs = now;
 	rate.lost = false;
+
+	if (typeChanged)
+	{
+		match_rate_elements();
+	}
 
 	if (changed)
 	{
@@ -1150,6 +1185,139 @@ void MyTCServer::update_rate_setpoints()
 			// sent continuously, so an element that connects (or reconnects) gets it within a second
 			send_rate_to_elements(channel, rate.ddi, rate.value);
 			rate.lastSentMs = now;
+		}
+	}
+}
+
+std::uint16_t MyTCServer::rate_channel_ddi(std::uint8_t channel) const
+{
+	const RateChannel &rate = rateChannels[channel - 1];
+	return rate.infoReceived ? rate.infoDdi : rate.ddi;
+}
+
+void MyTCServer::update_rate_channel_info(std::uint8_t channel, std::uint16_t ddi, const std::string &name)
+{
+	if (channel < 1 || channel > MAX_RATE_CHANNELS)
+	{
+		return;
+	}
+	if (!is_rate_setpoint_ddi(ddi))
+	{
+		ddi = 0; // not a rate type: the channel is not in use
+	}
+
+	std::lock_guard<std::recursive_mutex> lock(clientsMutex);
+	RateChannel &rate = rateChannels[channel - 1];
+	const std::uint16_t before = rate_channel_ddi(channel);
+	const bool first = !rate.infoReceived;
+	const bool renamed = rate.name != name;
+	rate.infoReceived = true;
+	rate.infoDdi = ddi;
+	rate.name = name;
+
+	if (first || renamed || before != ddi)
+	{
+		log("Rate") << "Channel " << int(channel) << " \"" << name << "\": " << (ddi != 0 ? "DDI " + std::to_string(ddi) : std::string("not in use")) << std::endl;
+	}
+	if (before != ddi)
+	{
+		match_rate_elements();
+	}
+	else if (ddi != 0 && (first || renamed))
+	{
+		// same type, new name (or the first info after the setpoints already matched elements): log their mapping with it
+		for (auto &client : clients)
+		{
+			for (const auto &element : client.second.get_rate_elements())
+			{
+				if (element.channel == channel)
+				{
+					log("Rate") << "Element " << element.elementNumber << " \"" << element.designator << "\" (DDI " << element.ddi
+					            << ") -> channel " << int(channel) << " \"" << name << "\"" << std::endl;
+					pendingRateMessages.push_back(element.designator + " -> " + (name.empty() ? "channel " + std::to_string(channel) : name));
+				}
+			}
+		}
+	}
+}
+
+std::vector<std::string> MyTCServer::take_rate_messages()
+{
+	std::lock_guard<std::recursive_mutex> lock(clientsMutex);
+	std::vector<std::string> result;
+	result.swap(pendingRateMessages);
+	return result;
+}
+
+void MyTCServer::match_rate_elements()
+{
+	for (auto &client : clients)
+	{
+		match_rate_elements(client.first, client.second, false);
+	}
+}
+
+void MyTCServer::match_rate_elements(std::shared_ptr<isobus::ControlFunction> client, ClientState &state, bool reportAll)
+{
+	const std::vector<RateElement> elements = state.get_rate_elements(); // a copy: channels are set below
+	for (std::size_t i = 0; i < elements.size(); i++)
+	{
+		const RateElement &element = elements[i];
+
+		// the channels of the element's type; exactly one is a match, two or more need an assignment
+		std::uint8_t match = 0;
+		std::uint8_t count = 0;
+		std::string sameType;
+		for (std::uint8_t channel = 1; channel <= MAX_RATE_CHANNELS; channel++)
+		{
+			if (rate_channel_ddi(channel) == element.ddi)
+			{
+				match = channel;
+				count++;
+				sameType += (sameType.empty() ? "" : ", ") + std::to_string(channel) + " \"" + rateChannels[channel - 1].name + "\"";
+			}
+		}
+		const std::uint8_t channel = (count == 1) ? match : 0;
+		const bool changed = (channel != element.channel);
+
+		if (changed)
+		{
+			if (element.channel != 0)
+			{
+				send_set_value(client, element.ddi, element.elementNumber, 0); // leaves its channel: stop it
+			}
+			state.set_rate_element_channel(i, channel);
+
+			const RateChannel &rate = rateChannels[channel == 0 ? 0 : channel - 1];
+			if (channel != 0 && rate.lastReceivedMs != 0 && !rate.lost && rate.ddi == element.ddi)
+			{
+				send_set_value(client, element.ddi, element.elementNumber, rate.value); // the channel's rate at once
+			}
+		}
+
+		if (changed || reportAll)
+		{
+			const std::string elementText = "Element " + std::to_string(element.elementNumber) + " \"" + element.designator + "\" (DDI " + std::to_string(element.ddi) + ")";
+			std::string logText;
+			std::string messageText;
+			if (channel != 0)
+			{
+				const std::string &name = rateChannels[channel - 1].name;
+				logText = elementText + " -> channel " + std::to_string(channel) + " \"" + name + "\"";
+				messageText = element.designator + " -> " + (name.empty() ? "channel " + std::to_string(channel) : name);
+			}
+			else if (count > 1)
+			{
+				logText = elementText + ": channels " + sameType + " are the same type, assignment needed";
+				messageText = element.designator + ": assignment needed";
+			}
+			else
+			{
+				logText = elementText + ": no RateController product of this type";
+				messageText = element.designator + ": no RC product of this type";
+			}
+			log("Rate") << logText << std::endl;
+			pendingRateMessages.push_back(messageText);
 		}
 	}
 }

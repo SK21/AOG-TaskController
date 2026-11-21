@@ -97,6 +97,7 @@ All PGNs sent **by AgIO/AgValonia to the TC** use source `0x7F`, except `0xD6` (
 | `0xE5` (229) | Section states (64 sections) | 8 | Bitfield: bit `8·j + i` of byte `j` is section `(8j + i)` ON/OFF |
 | `0xF1` (241) | Section control mode | 1 | `[mode]` where `1` = enabled, `0` = disabled |
 | `0xF2` (242) | Process data | 6 or 7 | `[DDI_lo, DDI_hi, val0, val1, val2, val3]` — DDI is little-endian `uint16`; value is little-endian `int32`. Rate setpoints add `[channel]` (see below) |
+| `0xF4` (244) | Rate channel info | 3 + name | `[channel, DDI_lo, DDI_hi, name...]` — from RateController; see "Rate channel info" below |
 
 #### `0xC9` — Subnet detection
 
@@ -141,11 +142,25 @@ Wraps a single ISO 11783 DDI/value pair. The TC currently dispatches on these DD
 
 **Rate setpoints (DDI 1/6/11).** Sent by RateController, one message per product, in the DDI's ISO unit (e.g. 1 L/ha = 100 mm³/m² = DDI 1 value `10000` at 0.01 mm³/m² per bit). An optional 7th byte is the **rate channel**, `1`–`5` (RateController's product + 1); without it, channel 1. Other channel numbers are ignored.
 
-- When a DDOP is activated, the TC lists every element with a settable DDI 1, 6 or 11 (log tag `[Rate]`). **Interim:** until channels can be assigned per element, every rate element is on channel 1; channels 2–5 reach no element.
+- When a DDOP is activated, the TC lists every element with a settable DDI 1, 6 or 11 (log tag `[Rate]`) and matches each to a channel (see "Rate channel info").
 - A setpoint is sent to each element of its channel that has the same DDI, as a value command, when it changes and then every 1 s, so an element that connects later gets it within a second. Negative values are sent as 0.
 - **Loss of setpoints:** if a channel gets nothing for 4 s, the TC sends 0 to its elements once and waits for a new setpoint. The sender must therefore send continuously (RateController sends every second), not only on change.
 
 Unknown DDIs are silently ignored (PGN 0xF2 is the generic process-data channel — the TC will gain more DDIs over time).
+
+#### `0xF4` — Rate channel info
+
+Sent by RateController (source `0x7F`) for each rate channel while any of its products sends setpoints: on a change and every 2 s. When its last product stops, every channel is sent once with DDI 0.
+
+| Byte | Field | Notes |
+|---|---|---|
+| 0 | Channel | `1`–`5` (RateController's product + 1) |
+| 1–2 | DDI | The channel's type: `1` volume, `6` mass, `11` count per area. `0` = channel not in use |
+| 3.. | Name | RateController's product name, UTF-8, 0–24 bytes, not NUL-terminated |
+
+**Matching (interim, automatic).** Each rate element goes on the channel of the same type (DDI). Several elements may share a channel (e.g. a split bin). An element with no channel of its type, or with two or more channels of its type (e.g. seed and fertiliser both by mass), is on no channel and gets no setpoint: two channels of one type need an assignment, which isn't available yet. Without channel info (an older sender), a channel's type is taken from its setpoints.
+
+Matching runs when a DDOP is activated and whenever a channel's type changes. An element that leaves a channel is sent 0 once; one that joins a channel with a current setpoint gets it at once. Every result is logged (`[Rate] Element 7 "Bin 1" (DDI 6) -> channel 1 "Fert"`) and shown on AgOpenGPS's map as a hardware message (`0xDD`, info).
 
 ### 2.6 PGNs outbound (TC → client)
 

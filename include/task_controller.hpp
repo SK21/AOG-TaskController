@@ -21,6 +21,7 @@
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <string>
 #include <vector>
 
 constexpr std::uint8_t NUMBER_SECTIONS_PER_CONDENSED_MESSAGE = 16;
@@ -38,7 +39,8 @@ struct RateElement
 {
 	std::uint16_t ddi; ///< Settable rate DDI: 1 volume, 6 mass or 11 count per area
 	std::uint16_t elementNumber; ///< The element the DDI belongs to
-	std::uint8_t channel; ///< Rate channel (1 = RateController product 1)
+	std::uint8_t channel; ///< Rate channel (1 = RateController product 1), 0 = not matched to a channel
+	std::string designator; ///< The element's DDOP designator, for the log
 };
 
 class ClientState
@@ -83,6 +85,7 @@ public:
 	void clear_rate_elements();
 	void add_rate_element(const RateElement &element);
 	const std::vector<RateElement> &get_rate_elements() const;
+	void set_rate_element_channel(std::size_t index, std::uint8_t channel);
 
 private:
 	isobus::DeviceDescriptorObjectPool pool; ///< The device descriptor object pool (DDOP) for the TC
@@ -164,6 +167,15 @@ public:
 	/// when a channel has had no setpoint for RATE_TIMEOUT_MS (lose the rate source, stop applying)
 	void update_rate_setpoints();
 
+	/// @brief Stores a channel's type and name from RateController (PGN 0xF4) and re-matches the rate elements when the type changed
+	/// @param channel Rate channel 1 to MAX_RATE_CHANNELS; others are ignored
+	/// @param ddi The channel's rate DDI (see is_rate_setpoint_ddi), 0 = channel not in use
+	/// @param name RateController's product name, for the log
+	void update_rate_channel_info(std::uint8_t channel, std::uint16_t ddi, const std::string &name);
+
+	/// @brief Returns (and clears) the element-to-channel changes since the last call, for AOG's hardware message
+	std::vector<std::string> take_rate_messages();
+
 private:
 	struct RateChannel
 	{
@@ -172,7 +184,19 @@ private:
 		std::uint32_t lastReceivedMs = 0; ///< When the last setpoint arrived
 		std::uint32_t lastSentMs = 0; ///< When it was last sent to the elements
 		bool lost = false; ///< Timed out and set to 0; waits for a new setpoint
+		bool infoReceived = false; ///< Channel info (PGN 0xF4) has arrived at least once
+		std::uint16_t infoDdi = 0; ///< The channel's type from its info, 0 = not in use
+		std::string name; ///< RateController's product name from the channel info
 	};
+
+	/// @brief The channel's type for matching: from its info once that has arrived, else from its setpoints (older senders)
+	std::uint16_t rate_channel_ddi(std::uint8_t channel) const;
+
+	/// @brief Matches every rate element of every client to the channel of the same type, sends 0 to elements that
+	/// lose their channel and logs each change. Two or more channels of one type match nothing. Caller must hold clientsMutex.
+	void match_rate_elements();
+	/// @param reportAll Log every element's result, not only changes (when the implement connects)
+	void match_rate_elements(std::shared_ptr<isobus::ControlFunction> client, ClientState &state, bool reportAll);
 	static constexpr std::uint32_t RATE_RESEND_MS = 1000;
 	static constexpr std::uint32_t RATE_TIMEOUT_MS = 4000;
 
@@ -196,6 +220,7 @@ private:
 	std::vector<bool> aogSectionDemand; ///< Last section states from AOG (PGN 229). Guarded by clientsMutex
 	std::uint32_t lastSectionDemandMs = 0; ///< When AOG's section demand was last received, 0 = never. Guarded by clientsMutex
 	std::array<RateChannel, MAX_RATE_CHANNELS> rateChannels; ///< Rate setpoints from RateController, index = channel - 1. Guarded by clientsMutex
+	std::vector<std::string> pendingRateMessages; ///< Element-to-channel changes for AOG's hardware message. Guarded by clientsMutex
 
 	/// @brief Guards clients and uploadedPools.
 	///

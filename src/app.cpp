@@ -544,6 +544,13 @@ void Application::setup_udp_connections()
 			log() << "Received request from AOG to change section control state to " << (sectionControlState == 1 ? "enabled" : "disabled") << std::endl;
 			tcServer->update_section_control_enabled(sectionControlState == 1);
 		}
+		else if (pgn == 0xF4 && data.size() >= 3) // 244 - Rate channel info from RateController: [channel][DDI lo, hi][name]
+		{
+			// not AOG traffic, so lastAogPacketMs is left alone (as for the rate setpoints on 0xF2)
+			const std::uint16_t ddi = static_cast<std::uint16_t>(data[1] | (data[2] << 8));
+			const std::string name(data.begin() + 3, data.end());
+			tcServer->update_rate_channel_info(data[0], ddi, name);
+		}
 		else if (pgn == 0xF3) // 243 - Field name, empty when the field is closed
 		{
 			lastAogPacketMs = isobus::SystemTiming::get_timestamp_ms();
@@ -694,6 +701,16 @@ bool Application::update()
 
 	tcServer->request_measurement_commands();
 	tcServer->update_rate_setpoints();
+	// element-to-channel changes, on AOG's map; one banner, as a second would replace the first
+	std::string rateMessage;
+	for (const auto &message : tcServer->take_rate_messages())
+	{
+		rateMessage += (rateMessage.empty() ? "" : "; ") + message;
+	}
+	if (!rateMessage.empty())
+	{
+		send_hardware_message(rateMessage, 5, HW_MSG_INFO);
+	}
 	warn_if_late("tcServer->update()", lastTcServerUpdateCallMs, 200);
 	tcServer->update();
 	if (tcFunctionalities)
