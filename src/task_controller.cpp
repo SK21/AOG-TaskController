@@ -841,6 +841,9 @@ bool MyTCServer::on_value_command(std::shared_ptr<isobus::ControlFunction> partn
 		}
 	}
 
+	// prescription control state / mode and default rates of the rate elements (step 3)
+	on_rx_value(clients[partner], dataDescriptionIndex, elementNumber, processDataValue);
+
 	// actual rates and totals of the rate elements, for RateController (PGN 0xF5)
 	clients[partner].store_rate_value(elementNumber, dataDescriptionIndex, processDataValue, std::max<std::uint32_t>(isobus::SystemTiming::get_timestamp_ms(), 1));
 
@@ -1034,6 +1037,7 @@ void MyTCServer::request_measurement_commands()
 			for (auto &element : client.second.get_rate_elements_mutable())
 			{
 				subscribe_rate_actuals(client.first, client.second, element);
+				find_rx_ddis(client.first, client.second, element);
 			}
 			match_rate_elements(client.first, client.second, true);
 
@@ -1180,12 +1184,333 @@ void MyTCServer::send_rate_to_elements(std::uint8_t channel, std::uint16_t ddi, 
 	{
 		for (const auto &element : client.second.get_rate_elements())
 		{
-			if (element.channel == channel && element.ddi == ddi)
+			if (element.channel == channel && element.ddi == ddi &&
+			    (element.rxState == RxState::Starting || element.rxState == RxState::Active))
 			{
 				send_set_value(client.first, ddi, element.elementNumber, value);
 			}
 		}
 	}
+}
+
+std::string MyTCServer::rate_element_text(const RateElement &element)
+{
+	return "Element " + std::to_string(element.elementNumber) + " \"" + element.designator + "\"";
+}
+
+void MyTCServer::send_rx_command(std::shared_ptr<isobus::ControlFunction> client, RateElement &element, const RateChannel *rate)
+{
+	constexpr std::uint16_t DDI_RX_STATE = 158; // Prescription Control State
+	constexpr std::uint16_t DDI_RX_SOURCE = 287; // Setpoint Prescription Mode
+	if (element.rxWanted == 1)
+	{
+		// ON in this order (step 3 § 5): 287 = 1 (TC rate), 158 = 1, then the setpoint straight after, without waiting
+		if (element.has287)
+		{
+			send_set_value(client, DDI_RX_SOURCE, element.sourceElement, 1);
+		}
+		if (element.has158)
+		{
+			send_set_value(client, DDI_RX_STATE, element.rxElement, 1);
+		}
+		if (rate && rate->ddi == element.ddi && rate->lastReceivedMs != 0)
+		{
+			send_set_value(client, element.ddi, element.elementNumber, rate->value);
+		}
+	}
+	else if (element.has158)
+	{
+		send_set_value(client, DDI_RX_STATE, element.rxElement, 0);
+	}
+
+	element.rxTries++;
+	element.rxConfirming = element.has158;
+	element.rxCommandMs = std::max<std::uint32_t>(isobus::SystemTiming::get_timestamp_ms(), 1);
+	element.rxAsked = false;
+}
+
+void MyTCServer::start_rate_element(std::shared_ptr<isobus::ControlFunction> client, RateElement &element, const RateChannel &rate)
+{
+	element.noReply = false;
+	element.rxTries = 0;
+	element.rxWanted = 1;
+	if (element.has158 && element.rxReported != 3) // 3 = not installed: as no 158
+	{
+		element.rxState = RxState::Starting;
+		log("Rate") << rate_element_text(element) << ": asking for prescription control (287 = 1, 158 = 1)" << std::endl;
+	}
+	else
+	{
+		element.rxState = RxState::Active;
+	}
+	send_rx_command(client, element, &rate);
+}
+
+void MyTCServer::hand_back_rate_element(std::shared_ptr<isobus::ControlFunction> client, RateElement &element, RxState newState)
+{
+	element.rxState = newState;
+	element.noReply = false;
+	element.rxTries = 0;
+	element.rxWanted = 0;
+	if (element.has158 && element.rxReported != 3)
+	{
+		send_rx_command(client, element, nullptr); // no 0 setpoint: in manual the implement uses its own rate
+	}
+	else
+	{
+		element.rxConfirming = false;
+		send_set_value(client, element.ddi, element.elementNumber, 0); // no 158 to hand back with: stop it
+	}
+}
+
+void MyTCServer::update_rx_confirm(std::shared_ptr<isobus::ControlFunction> client, RateElement &element, std::uint32_t now)
+{
+	constexpr std::uint16_t DDI_RX_STATE = 158;
+	if (!element.rxConfirming)
+	{
+		return;
+	}
+
+	if (!element.rxAsked)
+	{
+		if (isobus::SystemTiming::time_expired_ms(element.rxCommandMs, RX_CONFIRM_MS))
+		{
+			// a lost command causes no change, so the implement wouldn't report anything: ask for it
+			send_request_value(client, DDI_RX_STATE, element.rxElement);
+			element.rxAsked = true;
+			element.rxAskedMs = std::max<std::uint32_t>(now, 1);
+		}
+	}
+	else if (isobus::SystemTiming::time_expired_ms(element.rxAskedMs, RX_CONFIRM_MS))
+	{
+		if (element.rxTries < RX_TRIES)
+		{
+			const auto &rate = rateChannels[element.channel == 0 ? 0 : element.channel - 1];
+			send_rx_command(client, element, element.channel == 0 ? nullptr : &rate); // not answered: resend
+		}
+		else
+		{
+			element.rxConfirming = false;
+			element.noReply = true;
+			log("Rate") << rate_element_text(element) << ": no reply to prescription control state" << std::endl;
+			if (element.rxWanted == 1)
+			{
+				element.rxState = RxState::Refused;
+				pendingRateAlerts.push_back(element.designator + ": no reply to prescription control");
+			}
+			// for OFF: stays OFF, setpoints stop anyway
+		}
+	}
+}
+
+void MyTCServer::on_rx_value(ClientState &state, std::uint16_t ddi, std::uint16_t elementNumber, std::int32_t value)
+{
+	constexpr std::uint16_t DDI_RX_STATE = 158;
+	constexpr std::uint16_t DDI_RX_MODE = 288; // Actual Prescription Mode
+	const std::uint32_t now = std::max<std::uint32_t>(isobus::SystemTiming::get_timestamp_ms(), 1);
+
+	for (auto &element : state.get_rate_elements_mutable())
+	{
+		if (ddi == DDI_RX_MODE && element.has288 && element.modeElement == elementNumber)
+		{
+			element.modeReported = value;
+		}
+
+		if (element.defaultElement != 0 && element.defaultElement == elementNumber && ddi == element.ddi + 2) // 1 -> 3, 6 -> 8, 11 -> 13
+		{
+			element.hasDefault = true;
+			element.defaultRate = value;
+		}
+
+		if (ddi != DDI_RX_STATE || !element.has158 || element.rxElement != elementNumber)
+		{
+			continue;
+		}
+
+		const std::int32_t before = element.rxReported;
+		element.rxReported = value;
+		element.rxReportedMs = now;
+		element.noReply = false;
+		if (element.rxConfirming && (value == element.rxWanted || element.rxWanted == 1))
+		{
+			element.rxConfirming = false; // answered (a refusal is an answer too)
+		}
+
+		if (value == 1 || value == 3)
+		{
+			if (element.rxState == RxState::Starting)
+			{
+				element.rxState = RxState::Active;
+				log("Rate") << rate_element_text(element) << ": prescription control on" << std::endl;
+			}
+		}
+		else if (element.rxState == RxState::Starting || element.rxState == RxState::Active)
+		{
+			// 0 or 2: the implement or its operator chose this. Never asked again by itself.
+			const bool wasActive = element.rxState == RxState::Active;
+			element.rxState = RxState::Refused;
+			const std::string what = (value == 2) ? "reports a prescription control error" :
+			  (wasActive ? "turned prescription control off" : "refused prescription control");
+			log("Rate") << rate_element_text(element) << ": implement " << what << std::endl;
+			pendingRateAlerts.push_back(element.designator + ": " + what);
+		}
+		else if (before != value)
+		{
+			log("Rate") << rate_element_text(element) << ": prescription control state " << value << std::endl;
+		}
+	}
+}
+
+void MyTCServer::find_rx_ddis(std::shared_ptr<isobus::ControlFunction> client, ClientState &state, RateElement &element)
+{
+	using Trigger = isobus::task_controller_object::DeviceProcessDataObject::AvailableTriggerMethods;
+	constexpr std::uint16_t DDI_RX_STATE = 158;
+	constexpr std::uint16_t DDI_RX_SOURCE = 287;
+	constexpr std::uint16_t DDI_RX_MODE = 288;
+	const std::uint16_t defaultDdi = element.ddi + 2; // 3 volume, 8 mass, 13 count per area
+	auto &pool = state.get_pool();
+
+	auto onChange = [&](isobus::task_controller_object::DeviceProcessDataObject &processData, std::uint16_t elementNumber) {
+		if (processData.has_trigger_method(Trigger::OnChange))
+		{
+			send_change_threshold_measurement_command(client, processData.get_ddi(), elementNumber, 1);
+		}
+		else if (processData.has_trigger_method(Trigger::TimeInterval))
+		{
+			send_time_interval_measurement_command(client, processData.get_ddi(), elementNumber, 1000);
+		}
+		// else: the confirm requests it after each command
+	};
+
+	auto level = element_by_number(pool, element.elementNumber);
+	for (int depth = 0; level && depth < 8; depth++)
+	{
+		const std::uint16_t number = level->get_element_number();
+		if (!element.has158)
+		{
+			auto processData = child_process_data(pool, *level, DDI_RX_STATE);
+			if (processData)
+			{
+				element.has158 = true;
+				element.rxElement = number;
+				onChange(*processData, number);
+			}
+		}
+		if (!element.has287)
+		{
+			auto processData = child_process_data(pool, *level, DDI_RX_SOURCE);
+			if (processData && processData->has_property(isobus::task_controller_object::DeviceProcessDataObject::PropertiesBit::Settable))
+			{
+				element.has287 = true;
+				element.sourceElement = number;
+			}
+		}
+		if (!element.has288)
+		{
+			auto processData = child_process_data(pool, *level, DDI_RX_MODE);
+			if (processData)
+			{
+				element.has288 = true;
+				element.modeElement = number;
+				onChange(*processData, number);
+			}
+		}
+		if (!element.hasDefault && element.defaultElement == 0)
+		{
+			// the default rate as a fixed property, or as process data the implement is asked for
+			for (std::uint16_t childId : level->get_child_object_ids())
+			{
+				auto object = pool.get_object_by_id(childId);
+				if (!element.hasDefault && object && object->get_object_type() == isobus::task_controller_object::ObjectTypes::DeviceProperty)
+				{
+					auto property = std::dynamic_pointer_cast<isobus::task_controller_object::DevicePropertyObject>(object);
+					if (property && property->get_ddi() == defaultDdi)
+					{
+						element.hasDefault = true;
+						element.defaultRate = property->get_value();
+					}
+				}
+			}
+			if (!element.hasDefault)
+			{
+				auto processData = child_process_data(pool, *level, defaultDdi);
+				if (processData)
+				{
+					element.defaultElement = number;
+					send_request_value(client, defaultDdi, number);
+				}
+			}
+		}
+
+		auto parent = pool.get_object_by_id(level->get_parent_object());
+		level = (parent && parent->get_object_type() == isobus::task_controller_object::ObjectTypes::DeviceElement && parent != level) ?
+		  std::dynamic_pointer_cast<isobus::task_controller_object::DeviceElementObject>(parent) :
+		  nullptr;
+	}
+
+	log("Rate") << rate_element_text(element) << ": 158 " << (element.has158 ? "on element " + std::to_string(element.rxElement) : std::string("no"))
+	            << ", 287 " << (element.has287 ? "on element " + std::to_string(element.sourceElement) : std::string("no"))
+	            << ", 288 " << (element.has288 ? "on element " + std::to_string(element.modeElement) : std::string("no"))
+	            << ", default rate " << (element.hasDefault ? std::to_string(element.defaultRate) : (element.defaultElement != 0 ? std::string("requested") : std::string("no")))
+	            << std::endl;
+}
+
+void MyTCServer::update_rate_rx_request(std::uint8_t channel, std::int32_t value)
+{
+	if (channel < 1 || channel > MAX_RATE_CHANNELS)
+	{
+		return;
+	}
+
+	std::lock_guard<std::recursive_mutex> lock(clientsMutex);
+	RateChannel &rate = rateChannels[channel - 1];
+	rate.lastRcMs = std::max<std::uint32_t>(isobus::SystemTiming::get_timestamp_ms(), 1);
+	rate.lost = false;
+
+	if (value == 0)
+	{
+		// VR off: the implement's own rate. Repeating 0 is harmless; only a change acts.
+		if (rate.vrOn || rate.lastReceivedMs == 0)
+		{
+			log("Rate") << "Channel " << int(channel) << ": VR off, elements use their own rate (158 = 0)" << std::endl;
+		}
+		rate.vrOn = false;
+		for (auto &client : clients)
+		{
+			for (auto &element : client.second.get_rate_elements_mutable())
+			{
+				// also an element that is OFF but never commanded (just connected) and not known to be off
+				const bool neverCommanded = element.rxState == RxState::Off && element.rxTries == 0 && element.has158 && element.rxReported != 0;
+				if (element.channel == channel && (element.rxState != RxState::Off || neverCommanded))
+				{
+					hand_back_rate_element(client.first, element, RxState::Off);
+				}
+			}
+		}
+	}
+	else if (value == 1)
+	{
+		// "Ask again": a fresh request for elements that refused or didn't reply
+		log("Rate") << "Channel " << int(channel) << ": RateController asks again for prescription control" << std::endl;
+		for (auto &client : clients)
+		{
+			for (auto &element : client.second.get_rate_elements_mutable())
+			{
+				if (element.channel == channel && (element.rxState == RxState::Refused || element.noReply))
+				{
+					start_rate_element(client.first, element, rate);
+				}
+			}
+		}
+	}
+}
+
+std::vector<std::string> MyTCServer::take_rate_alerts()
+{
+	std::lock_guard<std::recursive_mutex> lock(clientsMutex);
+	std::vector<std::string> result;
+	result.swap(pendingRateAlerts);
+	return result;
 }
 
 void MyTCServer::update_rate_setpoint(std::uint8_t channel, std::uint16_t ddi, std::int32_t value)
@@ -1197,7 +1522,7 @@ void MyTCServer::update_rate_setpoint(std::uint8_t channel, std::uint16_t ddi, s
 
 	std::lock_guard<std::recursive_mutex> lock(clientsMutex);
 	RateChannel &rate = rateChannels[channel - 1];
-	const std::uint32_t now = isobus::SystemTiming::get_timestamp_ms();
+	const std::uint32_t now = std::max<std::uint32_t>(isobus::SystemTiming::get_timestamp_ms(), 1);
 	value = std::max<std::int32_t>(value, 0);
 
 	if (rate.ddi != 0 && rate.ddi != ddi && !rate.lost)
@@ -1208,13 +1533,19 @@ void MyTCServer::update_rate_setpoint(std::uint8_t channel, std::uint16_t ddi, s
 	const bool changed = (rate.lastReceivedMs == 0) || rate.lost || (rate.ddi != ddi) || (rate.value != value);
 	if (rate.lost)
 	{
-		log("Rate") << "Channel " << int(channel) << ": setpoints resumed" << std::endl;
+		log("Rate") << "Channel " << int(channel) << ": RateController heard again, setpoints resumed" << std::endl;
+	}
+	if (!rate.vrOn && rate.lastReceivedMs != 0)
+	{
+		log("Rate") << "Channel " << int(channel) << ": VR on, RateController's rate" << std::endl;
 	}
 	const bool typeChanged = !rate.infoReceived && rate.ddi != ddi; // without channel info the setpoints give the type
 	rate.ddi = ddi;
 	rate.value = value;
 	rate.lastReceivedMs = now;
+	rate.lastRcMs = now;
 	rate.lost = false;
+	rate.vrOn = true;
 
 	if (typeChanged)
 	{
@@ -1227,6 +1558,19 @@ void MyTCServer::update_rate_setpoint(std::uint8_t channel, std::uint16_t ddi, s
 		send_rate_to_elements(channel, ddi, value);
 		rate.lastSentMs = now;
 	}
+
+	// OFF (VR was off, or a new implement / DDOP) and FALLBACK start a fresh request; REFUSED waits for "Ask again"
+	for (auto &client : clients)
+	{
+		for (auto &element : client.second.get_rate_elements_mutable())
+		{
+			if (element.channel == channel && element.ddi == ddi &&
+			    (element.rxState == RxState::Off || element.rxState == RxState::Fallback))
+			{
+				start_rate_element(client.first, element, rate);
+			}
+		}
+	}
 }
 
 void MyTCServer::update_rate_setpoints()
@@ -1237,21 +1581,72 @@ void MyTCServer::update_rate_setpoints()
 	{
 		RateChannel &rate = rateChannels[i];
 		const std::uint8_t channel = i + 1;
-		if (rate.lastReceivedMs == 0 || rate.lost)
+
+		// confirm 158 after each command, whatever RC is doing
+		for (auto &client : clients)
+		{
+			for (auto &element : client.second.get_rate_elements_mutable())
+			{
+				if (element.channel == channel)
+				{
+					update_rx_confirm(client.first, element, now);
+				}
+			}
+		}
+
+		if (rate.lastRcMs == 0 || rate.lost)
 		{
 			continue;
 		}
 
-		if (isobus::SystemTiming::time_expired_ms(rate.lastReceivedMs, RATE_TIMEOUT_MS))
+		if (isobus::SystemTiming::time_expired_ms(rate.lastRcMs, RATE_TIMEOUT_MS))
 		{
-			// lose the rate source, stop applying: 0 once, then wait for a new setpoint
-			log("Rate") << "Channel " << int(channel) << ": no setpoint for " << RATE_TIMEOUT_MS / 1000 << " s, sending 0" << std::endl;
-			send_rate_to_elements(channel, rate.ddi, 0);
+			// FALLBACK (step 3 D1): nothing from RC (no setpoint, no 158 = 0). Per element on RC's rate: its default
+			// rate with 287 = 2 if the DDOP has one, else hand back (158 = 0); without either, 0 (stop). OFF and
+			// REFUSED stay as they are.
+			log("Rate") << "Channel " << int(channel) << ": nothing from RateController for " << RATE_TIMEOUT_MS / 1000 << " s, fallback" << std::endl;
 			rate.lost = true;
+			for (auto &client : clients)
+			{
+				for (auto &element : client.second.get_rate_elements_mutable())
+				{
+					if (element.channel != channel || (element.rxState != RxState::Starting && element.rxState != RxState::Active))
+					{
+						continue;
+					}
+
+					std::string how;
+					if (element.hasDefault)
+					{
+						constexpr std::uint16_t DDI_RX_SOURCE = 287;
+						element.rxState = RxState::Fallback;
+						element.rxConfirming = false;
+						if (element.has287)
+						{
+							send_set_value(client.first, DDI_RX_SOURCE, element.sourceElement, 2); // 2 = default rate
+						}
+						send_set_value(client.first, element.ddi, element.elementNumber, element.defaultRate);
+						how = "default rate " + std::to_string(element.defaultRate);
+					}
+					else if (element.has158 && element.rxReported != 3)
+					{
+						hand_back_rate_element(client.first, element, RxState::Fallback);
+						how = "handed back (158 = 0)";
+					}
+					else
+					{
+						element.rxState = RxState::Fallback;
+						send_set_value(client.first, element.ddi, element.elementNumber, 0);
+						how = "stopped (0)";
+					}
+					log("Rate") << rate_element_text(element) << ": fallback, " << how << std::endl;
+					pendingRateAlerts.push_back(element.designator + ": RC lost, " + how);
+				}
+			}
 		}
-		else if (isobus::SystemTiming::time_expired_ms(rate.lastSentMs, RATE_RESEND_MS))
+		else if (rate.vrOn && rate.lastReceivedMs != 0 && isobus::SystemTiming::time_expired_ms(rate.lastSentMs, RATE_RESEND_MS))
 		{
-			// sent continuously, so an element that connects (or reconnects) gets it within a second
+			// sent continuously to the elements on RC's rate, so one that reconnects gets it within a second
 			send_rate_to_elements(channel, rate.ddi, rate.value);
 			rate.lastSentMs = now;
 		}
@@ -1411,6 +1806,11 @@ std::vector<RateChannelActuals> MyTCServer::get_rate_channel_actuals()
 		std::int64_t totalSum = 0;
 		bool totalSeen = false;
 		std::vector<std::pair<isobus::ControlFunction *, std::uint32_t>> totalsCounted; // a parent's total once
+		bool any158 = false;
+		bool all158On = true;
+		std::int32_t lowestOther = 3;
+		bool noReply = false;
+		bool modeSeen = false;
 
 		for (auto &client : clients)
 		{
@@ -1421,6 +1821,24 @@ std::vector<RateChannelActuals> MyTCServer::get_rate_channel_actuals()
 					continue;
 				}
 				actuals.elements++;
+
+				// 158 = 1 only if every element with 158 reports 1, else the lowest other value; 288 from the first
+				if (element.has158)
+				{
+					any158 = true;
+					const std::int32_t reported = (element.rxReported < 0) ? 0 : element.rxReported;
+					if (reported != 1)
+					{
+						all158On = false;
+						lowestOther = std::min(lowestOther, reported);
+					}
+				}
+				noReply = noReply || element.noReply;
+				if (element.has288 && !modeSeen)
+				{
+					modeSeen = true;
+					actuals.mode = static_cast<std::uint8_t>(std::max<std::int32_t>(0, std::min<std::int32_t>(element.modeReported, 255)));
+				}
 
 				// values the implement only sends on request
 				if (element.pollActual)
@@ -1474,11 +1892,24 @@ std::vector<RateChannelActuals> MyTCServer::get_rate_channel_actuals()
 			actuals.total = static_cast<std::int32_t>(std::min<std::int64_t>(totalSum, INT32_MAX));
 			actuals.flags |= 0x02;
 		}
-
-		const bool hasElements = actuals.elements > 0;
-		if (hasElements || actualsReported[channel - 1])
+		if (any158)
 		{
-			result.push_back(actuals); // one more with no elements after a channel loses them
+			const std::int32_t state = all158On ? 1 : lowestOther;
+			actuals.flags |= static_cast<std::uint8_t>((state & 0x03) << 2);
+			actuals.flags |= 0x10;
+		}
+		if (noReply)
+		{
+			actuals.flags |= 0x20;
+		}
+
+		// every channel RC announced (0xF4 DDI != 0), with elements = 0 when none are matched, so RC can tell
+		// "TC there, nothing matched" from "no TC"; and once more after a channel loses its elements
+		const bool hasElements = actuals.elements > 0;
+		const bool announced = rateChannels[channel - 1].infoReceived && rateChannels[channel - 1].infoDdi != 0;
+		if (hasElements || announced || actualsReported[channel - 1])
+		{
+			result.push_back(actuals);
 		}
 		if (hasElements != actualsReported[channel - 1])
 		{
@@ -1522,16 +1953,17 @@ void MyTCServer::match_rate_elements(std::shared_ptr<isobus::ControlFunction> cl
 
 		if (changed)
 		{
-			if (element.channel != 0)
+			RateElement &live = state.get_rate_elements_mutable()[i];
+			if (element.channel != 0 && live.rxState != RxState::Off)
 			{
-				send_set_value(client, element.ddi, element.elementNumber, 0); // leaves its channel: stop it
+				hand_back_rate_element(client, live, RxState::Off); // leaves its channel: back to its own rate (no 158: 0)
 			}
 			state.set_rate_element_channel(i, channel);
 
 			const RateChannel &rate = rateChannels[channel == 0 ? 0 : channel - 1];
-			if (channel != 0 && rate.lastReceivedMs != 0 && !rate.lost && rate.ddi == element.ddi)
+			if (channel != 0 && rate.vrOn && rate.lastReceivedMs != 0 && !rate.lost && rate.ddi == element.ddi)
 			{
-				send_set_value(client, element.ddi, element.elementNumber, rate.value); // the channel's rate at once
+				start_rate_element(client, live, rate); // the channel's rate at once, as a fresh request
 			}
 		}
 

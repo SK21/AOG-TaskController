@@ -135,22 +135,38 @@ Wraps a single ISO 11783 DDI/value pair. The TC currently dispatches on these DD
 
 | DDI (decimal) | Name | TC behavior |
 |---|---|---|
-| `156` | Actual speed (mm/s) | Stored. If TECU enabled, broadcast as Ground/Wheel/Machine-selected speed (PGN 65256) + NMEA2000 SOG. Drives forward/reverse direction. Also produces J1939 PGN 65256 every 100 ms. |
+| `397` | Actual speed (mm/s) | Stored. If TECU enabled, broadcast as Ground/Wheel/Machine-selected speed (PGN 65256) + NMEA2000 SOG. Drives forward/reverse direction. Also produces J1939 PGN 65256 every 100 ms. |
 | `597` | Total distance (mm) | Stored and displayed on the VT Status page. If TECU is enabled, also populated into Speed Messages distance fields. |
 | Guidance line deviation | XTE (mm) | Converted to metres. Broadcast as NMEA2000 XTE (PGN 0x1F903) at 1 Hz. |
 | `1`, `6`, `11` | Setpoint volume (mm³/m²), mass (mg/m²) or count (/m²) per area application rate | Rate setpoint for a rate channel (see below). Not counted as AOG traffic. |
+| `158` | Prescription control state | RateController's prescription request for a rate channel (see below): `0` = VR off, `1` = ask again. Not counted as AOG traffic. |
 
-**Rate setpoints (DDI 1/6/11).** Sent by RateController, one message per product, in the DDI's ISO unit (e.g. 1 L/ha = 100 mm³/m² = DDI 1 value `10000` at 0.01 mm³/m² per bit). An optional 7th byte is the **rate channel**, `1`–`5` (RateController's product + 1); without it, channel 1. Other channel numbers are ignored.
+**Rate setpoints (DDI 1/6/11).** Sent by RateController while its VR (Rx) button is on, one message per product, every 1 s and on change, in the DDI's ISO unit (e.g. 1 L/ha = 100 mm³/m² = DDI 1 value `10000` at 0.01 mm³/m² per bit). An optional 7th byte is the **rate channel**, `1`–`5` (RateController's product + 1); without it, channel 1. Other channel numbers are ignored.
 
-- When a DDOP is activated, the TC lists every element with a settable DDI 1, 6 or 11 (log tag `[Rate]`) and matches each to a channel (see "Rate channel info").
-- A setpoint is sent to each element of its channel that has the same DDI, as a value command, when it changes and then every 1 s, so an element that connects later gets it within a second. Negative values are sent as 0.
-- **Loss of setpoints:** if a channel gets nothing for 4 s, the TC sends 0 to its elements once and waits for a new setpoint. The sender must therefore send continuously (RateController sends every second), not only on change.
+- When a DDOP is activated, the TC lists every element with a settable DDI 1, 6 or 11 (log tag `[Rate]`) and matches each to a channel (see "Rate channel info"). For each it also finds DDI 158 (prescription control state), 287 (setpoint prescription mode, settable) and 288 (actual prescription mode) on the element or its nearest parent, and the default rate (DDI 3 / 8 / 13, a property, or process data the TC asks for). 158 and 288 are asked for on change.
+- A setpoint goes only to elements on the channel's DDI that take RateController's rate (STARTING or ACTIVE below), when it changes and then every 1 s. Negative values are sent as 0.
+
+**Prescription request (DDI 158).** `[0x9E, 0x00][int32 0 or 1][channel]`. RateController sends `0` every 1 s per product while VR is off (only a change acts), and `1` once for "Ask again".
+
+**Channel states, per element:**
+
+| State | How it gets there | What the TC does |
+|---|---|---|
+| OFF | Start; RC sends 158 = 0 (VR off); the element leaves its channel | 158 = 0 (confirmed); no 0 setpoint, so the implement uses its own rate. An element without 158 is sent 0 (stop) instead |
+| STARTING | A setpoint arrives for an element that is OFF or in FALLBACK; a new implement / DDOP; "Ask again" | 287 = 1 (if settable), 158 = 1, then the setpoint straight after; confirm |
+| ACTIVE | The implement reports 158 = 1. An element without 158 (or reporting 3, not installed) is ACTIVE at once | Setpoints as above |
+| REFUSED | The implement reports 158 = 0 or 2 while STARTING or ACTIVE, or never replies | Setpoints stop. Logged (`[Rate] Element 20 "Rate 1": implement turned prescription control off`) and shown as an alarm hardware message. **Never asked again by the TC**; only RateController's "Ask again" restarts it |
+| FALLBACK | Nothing from RateController for the channel for 3 s (no setpoint, no 158) while STARTING or ACTIVE | With a default rate: 287 = 2 and the default rate. Without: 158 = 0 (hand back). Without either: 0. Alarm hardware message. The next setpoint starts it again |
+
+**Confirming 158.** A lost command changes nothing, so the implement would report nothing. About 1 s after each 158 command without the new state reported, the TC requests 158; if that gets no reply within 1 s, it resends the command (for ON: 287, 158 and the setpoint). After 3 commands without a reply the element is REFUSED (for ON) with **no reply** set (`0xF5` flags bit 5), logged `no reply to prescription control state`. For OFF the TC stops anyway. "No reply" clears when the element reports 158 or a new request starts.
+
+The sender must send continuously (RateController sends every second), not only on change: 3 s of silence is a lost RateController.
 
 Unknown DDIs are silently ignored (PGN 0xF2 is the generic process-data channel — the TC will gain more DDIs over time).
 
 #### `0xF4` — Rate channel info
 
-Sent by RateController (source `0x7F`) for each rate channel while any of its products sends setpoints: on a change and every 2 s. When its last product stops, every channel is sent once with DDI 0.
+Sent by RateController (source `0x7F`) for each rate channel while any of its products is an ISOBUS product (whatever VR is, so a channel keeps its elements and its actuals with VR off): on a change and every 2 s. When its last ISOBUS product stops, every channel is sent once with DDI 0.
 
 | Byte | Field | Notes |
 |---|---|---|
@@ -160,7 +176,7 @@ Sent by RateController (source `0x7F`) for each rate channel while any of its pr
 
 **Matching (interim, automatic).** Each rate element goes on the channel of the same type (DDI). Several elements may share a channel (e.g. a split bin). An element with no channel of its type, or with two or more channels of its type (e.g. seed and fertiliser both by mass), is on no channel and gets no setpoint: two channels of one type need an assignment, which isn't available yet. Without channel info (an older sender), a channel's type is taken from its setpoints.
 
-Matching runs when a DDOP is activated and whenever a channel's type changes. An element that leaves a channel is sent 0 once; one that joins a channel with a current setpoint gets it at once. Every result is logged (`[Rate] Element 7 "Bin 1" (DDI 6) -> channel 1 "Fert"`) and shown on AgOpenGPS's map as a hardware message (`0xDD`, info).
+Matching runs when a DDOP is activated and whenever a channel's type changes. An element that leaves a channel goes OFF (158 = 0; without 158, 0 once); one that joins a channel with a current setpoint (VR on) goes STARTING at once. Every result is logged (`[Rate] Element 7 "Bin 1" (DDI 6) -> channel 1 "Fert"`) and shown on AgOpenGPS's map as a hardware message (`0xDD`, info).
 
 ### 2.6 PGNs outbound (TC → client)
 
@@ -170,11 +186,11 @@ All PGNs sent **by the TC to AgIO/AgValonia** use source `0x80`.
 |---|---|---|---|---|
 | `0xDD` (221) | Hardware message | 2 + T | On event | `[duration, colour, text0, text1, ...]` — `T` = UTF-8 text bytes |
 | `0xF0` (240) | Section heartbeat / state | 2 + ⌈N/8⌉ | 100 ms | `[mode, num_sections, byte0, byte1, ...]` |
-| `0xF5` (245) | Rate channel actuals, to RateController | 15 | 1 s per channel | See "Rate channel actuals" below. Sent to RateController's address, not broadcast |
+| `0xF5` (245) | Rate channel actuals, to RateController | 16 | 1 s per channel | See "Rate channel actuals" below. Sent to RateController's address, not broadcast |
 
 #### `0xF5` — Rate channel actuals
 
-What the implement reports for each RateController rate channel (see `0xF4`), so RateController records the applied rate and quantity rather than its target. Sent every second for each channel with matched elements, and once more (elements `0`, flags `0`) after a channel loses them. Sent **to the address and port the last `0xF4` came from** (RateController's own socket), not to the `.255:9999` broadcast.
+What the implement reports for each RateController rate channel (see `0xF4`), so RateController records the applied rate and quantity rather than its target. Sent every second for each channel RateController has announced (`0xF4` with DDI ≠ 0), with elements `0` when none are matched (so RateController can tell "TC there, nothing matched" from "no TC"), and once more after a channel loses its elements. Sent **to the address and port the last `0xF4` came from** (RateController's own socket), not to the `.255:9999` broadcast.
 
 | Byte | Field | Notes |
 |---|---|---|
@@ -184,7 +200,8 @@ What the implement reports for each RateController rate channel (see `0xF4`), so
 | 7–8 | Total DDI | `351` (mL), `352` (g) or `82` (count); `0` = no total |
 | 9–12 | Total | `int32`: sum of the elements' application totals in that unit (a total on a shared parent element counted once; DDI 80 (L) and 81 (kg) are converted to mL and g) |
 | 13 | Elements | Elements matched to the channel |
-| 14 | Flags | bit 0 rate valid, bit 1 total valid |
+| 14 | Flags | bit 0 rate valid, bit 1 total valid, bits 2–3 DDI 158 as reported (0 off, 1 on, 2 error, 3 not installed; with several elements, 1 only if every element with 158 reports 1, else the lowest other value), bit 4 channel has 158, bit 5 no reply to 158 (any element) |
+| 15 | Prescription mode | DDI 288 as the first element with it reports it (1 TC rate, 2 manual, 3 peer, 4/5 max/min override); `0` = unknown or not present |
 
 **Subscriptions.** For each rate element the TC looks for its actual rate DDI (on the element) and an application total of the same kind (DDI 351 or 80 for volume, 352 or 81 for mass, 82 for count; on the element, else the nearest parent element that has one). Each is asked for every 1 s by time-interval measurement command if the DDOP offers that trigger, else on change, else the TC requests the value every second. Each element's result is logged (`[Rate] Element 20 "Rate 1": actual DDI 2 every 1 s, total DDI 351 on element 20 every 1 s`).
 

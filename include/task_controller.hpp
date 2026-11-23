@@ -34,6 +34,16 @@ enum SectionState : std::uint8_t
 	NOT_INSTALLED = 3 ///< Section is not installed
 };
 
+/// @brief A rate element's prescription state (Group2_Step3_Prescription_State_Design.md § 5)
+enum class RxState : std::uint8_t
+{
+	Off = 0, ///< No RC rate: VR off or the channel not in use; the implement uses its own rate
+	Starting = 1, ///< 287 = 1, 158 = 1 and the setpoint sent; waiting for the implement to report 158 = 1
+	Active = 2, ///< The implement takes RC's rate (158 = 1, or the element has no 158)
+	Refused = 3, ///< The implement turned 158 off, refused it, reports an error, or never replied; only "Ask again" restarts it
+	Fallback = 4 ///< Nothing from RC for RATE_TIMEOUT_MS: its default rate (287 = 2), else handed back (158 = 0)
+};
+
 /// @brief An implement element that takes a rate setpoint, and the rate channel that drives it
 struct RateElement
 {
@@ -50,6 +60,29 @@ struct RateElement
 	std::uint32_t totalMs = 0; ///< When it arrived, 0 = never
 	bool pollActual = false; ///< The implement offers no time-interval or on-change trigger: request it every second
 	bool pollTotal = false; ///< As pollActual, for the total
+
+	// prescription control (step 3): each DDI on the element or its nearest parent that has it
+	bool has158 = false; ///< DDI 158 Prescription Control State is declared
+	std::uint16_t rxElement = 0; ///< The element that has 158
+	bool has287 = false; ///< DDI 287 Setpoint Prescription Mode is declared and settable
+	std::uint16_t sourceElement = 0; ///< The element that has 287
+	bool has288 = false; ///< DDI 288 Actual Prescription Mode is declared
+	std::uint16_t modeElement = 0; ///< The element that has 288
+	bool hasDefault = false; ///< The default rate (DDI 3 / 8 / 13) is known
+	std::int32_t defaultRate = 0; ///< In the rate DDI's unit
+	std::uint16_t defaultElement = 0; ///< The element of a default rate held as process data (requested), 0 = none or a property
+
+	RxState rxState = RxState::Off;
+	std::int32_t rxReported = -1; ///< 158 as the implement last reported it, -1 = never
+	std::uint32_t rxReportedMs = 0; ///< When, 0 = never
+	std::int32_t modeReported = 0; ///< 288 as last reported, 0 = unknown
+	std::uint8_t rxWanted = 0; ///< The 158 value last commanded (1 on, 0 off)
+	bool rxConfirming = false; ///< Waiting for the implement to confirm rxWanted
+	std::uint32_t rxCommandMs = 0; ///< When rxWanted was last commanded
+	bool rxAsked = false; ///< 158 requested since the last command
+	std::uint32_t rxAskedMs = 0; ///< When it was requested
+	std::uint8_t rxTries = 0; ///< Commands sent for this request (RX_TRIES without a reply = no reply)
+	bool noReply = false; ///< No reply to 158 after the resends; cleared when it reports 158 or a new request starts
 };
 
 /// @brief What one rate channel's elements report, for RateController (PGN 0xF5)
@@ -61,7 +94,8 @@ struct RateChannelActuals
 	std::uint16_t totalDdi = 0; ///< 351 (mL), 352 (g) or 82 (count); 0 = no total
 	std::int32_t total = 0; ///< Sum of the elements' totals (a parent's total counted once), in totalDdi's unit
 	std::uint8_t elements = 0; ///< Elements matched to the channel
-	std::uint8_t flags = 0; ///< bit 0 rate valid, bit 1 total valid
+	std::uint8_t flags = 0; ///< bit 0 rate valid, bit 1 total valid, bits 2-3 158 as reported, bit 4 has 158, bit 5 no reply
+	std::uint8_t mode = 0; ///< 288 as the first element with it reports it, 0 = unknown / not present
 };
 
 class ClientState
@@ -191,6 +225,13 @@ public:
 	/// when a channel has had no setpoint for RATE_TIMEOUT_MS (lose the rate source, stop applying)
 	void update_rate_setpoints();
 
+	/// @brief RateController's prescription request for a channel (PGN 0xF2 with DDI 158): 0 = VR off, hand the channel's
+	/// elements back to their own rate; 1 = "Ask again", a fresh request for elements that refused or didn't reply
+	void update_rate_rx_request(std::uint8_t channel, std::int32_t value);
+
+	/// @brief Returns (and clears) rate alarms since the last call (refused, no reply, fallback), for AOG's hardware message
+	std::vector<std::string> take_rate_alerts();
+
 	/// @brief Stores a channel's type and name from RateController (PGN 0xF4) and re-matches the rate elements when the type changed
 	/// @param channel Rate channel 1 to MAX_RATE_CHANNELS; others are ignored
 	/// @param ddi The channel's rate DDI (see is_rate_setpoint_ddi), 0 = channel not in use
@@ -212,7 +253,9 @@ private:
 		std::int32_t value = 0; ///< Last setpoint
 		std::uint32_t lastReceivedMs = 0; ///< When the last setpoint arrived
 		std::uint32_t lastSentMs = 0; ///< When it was last sent to the elements
-		bool lost = false; ///< Timed out and set to 0; waits for a new setpoint
+		bool lost = false; ///< Nothing from RC for RATE_TIMEOUT_MS: elements in fallback; waits for RC
+		bool vrOn = false; ///< RC sends setpoints (VR on); false after its DDI 158 = 0 (VR off)
+		std::uint32_t lastRcMs = 0; ///< When RC last sent anything for the channel (setpoint or DDI 158), 0 = never
 		bool infoReceived = false; ///< Channel info (PGN 0xF4) has arrived at least once
 		std::uint16_t infoDdi = 0; ///< The channel's type from its info, 0 = not in use
 		std::string name; ///< RateController's product name from the channel info
@@ -227,10 +270,29 @@ private:
 	/// @param reportAll Log every element's result, not only changes (when the implement connects)
 	void match_rate_elements(std::shared_ptr<isobus::ControlFunction> client, ClientState &state, bool reportAll);
 	static constexpr std::uint32_t RATE_RESEND_MS = 1000;
-	static constexpr std::uint32_t RATE_TIMEOUT_MS = 4000;
+	static constexpr std::uint32_t RATE_TIMEOUT_MS = 3000; ///< Nothing from RC this long: FALLBACK (step 3 D1)
+	static constexpr std::uint32_t RX_CONFIRM_MS = 1000; ///< 158 unconfirmed this long after a command: request it; again: resend
+	static constexpr std::uint8_t RX_TRIES = 3; ///< Commands without a reply before "no reply"
 
-	/// @brief Sends a value to every element on the channel that uses the given DDI. Caller must hold clientsMutex.
+	/// @brief Sends the setpoint to every element on the channel that uses the given DDI and takes RC's rate
+	/// (STARTING or ACTIVE). Caller must hold clientsMutex.
 	void send_rate_to_elements(std::uint8_t channel, std::uint16_t ddi, std::int32_t value);
+
+	/// @brief A fresh request for RC's rate: 287 = 1, 158 = 1, the setpoint, then confirm. An element without 158 is
+	/// ACTIVE at once. Caller must hold clientsMutex.
+	void start_rate_element(std::shared_ptr<isobus::ControlFunction> client, RateElement &element, const RateChannel &rate);
+	/// @brief Hand back to the implement's own rate: 158 = 0 (confirmed), no 0 setpoint; without 158, 0 (stop).
+	/// Caller must hold clientsMutex.
+	void hand_back_rate_element(std::shared_ptr<isobus::ControlFunction> client, RateElement &element, RxState newState);
+	/// @brief Sends element.rxWanted (with 287 and the setpoint for ON) and starts the confirm timer
+	void send_rx_command(std::shared_ptr<isobus::ControlFunction> client, RateElement &element, const RateChannel *rate);
+	/// @brief Confirms 158 after a command: request after RX_CONFIRM_MS, resend after another, "no reply" after RX_TRIES
+	void update_rx_confirm(std::shared_ptr<isobus::ControlFunction> client, RateElement &element, std::uint32_t now);
+	/// @brief The implement reported 158 or 288 for an element: state changes, logs and alarms. Caller must hold clientsMutex.
+	void on_rx_value(ClientState &state, std::uint16_t ddi, std::uint16_t elementNumber, std::int32_t value);
+	/// @brief Finds 158, 287, 288 and the default rate on the element or a parent, and asks for 158 / 288 on change
+	void find_rx_ddis(std::shared_ptr<isobus::ControlFunction> client, ClientState &state, RateElement &element);
+	static std::string rate_element_text(const RateElement &element);
 
 	/// @brief Sends every condensed setpoint block and DDI 289, even when unchanged (ISO 11783-10 F.3.5.3 b)
 	void send_all_section_setpoint_states(std::shared_ptr<isobus::ControlFunction> client);
@@ -250,6 +312,7 @@ private:
 	std::uint32_t lastSectionDemandMs = 0; ///< When AOG's section demand was last received, 0 = never. Guarded by clientsMutex
 	std::array<RateChannel, MAX_RATE_CHANNELS> rateChannels; ///< Rate setpoints from RateController, index = channel - 1. Guarded by clientsMutex
 	std::vector<std::string> pendingRateMessages; ///< Element-to-channel changes for AOG's hardware message. Guarded by clientsMutex
+	std::vector<std::string> pendingRateAlerts; ///< Refused / no reply / fallback, for AOG's alarm hardware message. Guarded by clientsMutex
 	std::array<bool, MAX_RATE_CHANNELS> actualsReported{}; ///< Channel had elements at the last get_rate_channel_actuals. Guarded by clientsMutex
 	static constexpr std::uint32_t RATE_ACTUAL_FRESH_MS = 3000; ///< An element's actual or total older than this isn't used
 

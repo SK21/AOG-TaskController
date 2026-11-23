@@ -590,9 +590,11 @@ void Application::setup_udp_connections()
 			const std::int32_t value = static_cast<std::int32_t>(rawValue);
 			const auto ddi = static_cast<std::uint16_t>(identifier);
 			const bool rateSetpoint = MyTCServer::is_rate_setpoint_ddi(ddi);
-			if (!rateSetpoint)
+			constexpr std::uint16_t DDI_RX_STATE = 158; // RateController's prescription request (step 3)
+			const bool rxRequest = (ddi == DDI_RX_STATE);
+			if (!rateSetpoint && !rxRequest)
 			{
-				lastAogPacketMs = isobus::SystemTiming::get_timestamp_ms(); // rate setpoints come from RateController, not AOG
+				lastAogPacketMs = isobus::SystemTiming::get_timestamp_ms(); // rate setpoints and 158 come from RateController, not AOG
 			}
 
 			if (rateSetpoint)
@@ -600,6 +602,12 @@ void Application::setup_udp_connections()
 				// [6] = rate channel 1-5 (RateController's product + 1); without it, channel 1
 				const std::uint8_t channel = (data.size() >= 7) ? data[6] : 1;
 				tcServer->update_rate_setpoint(channel, ddi, value);
+			}
+			else if (rxRequest)
+			{
+				// [DDI 158][0 = VR off, 1 = ask again][channel]
+				const std::uint8_t channel = (data.size() >= 7) ? data[6] : 1;
+				tcServer->update_rate_rx_request(channel, value);
 			}
 			else if (identifier == isobus::DataDescriptionIndex::ActualSpeed)
 			{
@@ -717,6 +725,16 @@ bool Application::update()
 	if (!rateMessage.empty())
 	{
 		send_hardware_message(rateMessage, 5, HW_MSG_INFO);
+	}
+	// prescription control alarms (refused, no reply, RC lost): one banner
+	std::string rateAlert;
+	for (const auto &alert : tcServer->take_rate_alerts())
+	{
+		rateAlert += (rateAlert.empty() ? "" : "; ") + alert;
+	}
+	if (!rateAlert.empty())
+	{
+		send_hardware_message(rateAlert, 10, HW_MSG_ALERT);
 	}
 	send_rate_actuals();
 	warn_if_late("tcServer->update()", lastTcServerUpdateCallMs, 200);
@@ -925,14 +943,15 @@ bool Application::update()
 
 void Application::send_rate_actuals()
 {
-	// PGN 0xF5 to RateController, per channel with matched elements (and once after it loses them):
-	// [channel][actual DDI lo, hi][rate int32][total DDI lo, hi][total int32][elements][flags]
+	// PGN 0xF5 to RateController, per announced channel (elements 0 when none match) and once after it loses them:
+	// [channel][actual DDI lo, hi][rate int32][total DDI lo, hi][total int32][elements][flags][288]
+	// flags: bit 0 rate valid, 1 total valid, 2-3 158 as reported, 4 has 158, 5 no reply
 	if (rateControllerEndpoint && isobus::SystemTiming::time_expired_ms(lastRateActualsMs, 1000))
 	{
 		lastRateActualsMs = isobus::SystemTiming::get_timestamp_ms();
 		for (const auto &actuals : tcServer->get_rate_channel_actuals())
 		{
-			std::array<std::uint8_t, 15> payload = {
+			std::array<std::uint8_t, 16> payload = {
 				actuals.channel,
 				static_cast<std::uint8_t>(actuals.actualDdi & 0xFF),
 				static_cast<std::uint8_t>(actuals.actualDdi >> 8),
@@ -947,7 +966,8 @@ void Application::send_rate_actuals()
 				static_cast<std::uint8_t>((actuals.total >> 16) & 0xFF),
 				static_cast<std::uint8_t>((actuals.total >> 24) & 0xFF),
 				actuals.elements,
-				actuals.flags
+				actuals.flags,
+				actuals.mode
 			};
 			udpConnections->send_to(*rateControllerEndpoint, 0x80, 0xF5, payload);
 		}
