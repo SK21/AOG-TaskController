@@ -1470,11 +1470,12 @@ void MyTCServer::update_rate_rx_request(std::uint8_t channel, std::int32_t value
 	if (value == 0)
 	{
 		// VR off: the implement's own rate. Repeating 0 is harmless; only a change acts.
-		if (rate.vrOn || rate.lastReceivedMs == 0)
+		if (rate.vrOn || !rate.vrOffLogged)
 		{
 			log("Rate") << "Channel " << int(channel) << ": VR off, elements use their own rate (158 = 0)" << std::endl;
 		}
 		rate.vrOn = false;
+		rate.vrOffLogged = true;
 		for (auto &client : clients)
 		{
 			for (auto &element : client.second.get_rate_elements_mutable())

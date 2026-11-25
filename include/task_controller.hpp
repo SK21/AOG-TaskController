@@ -255,6 +255,7 @@ private:
 		std::uint32_t lastSentMs = 0; ///< When it was last sent to the elements
 		bool lost = false; ///< Nothing from RC for RATE_TIMEOUT_MS: elements in fallback; waits for RC
 		bool vrOn = false; ///< RC sends setpoints (VR on); false after its DDI 158 = 0 (VR off)
+		bool vrOffLogged = false; ///< "VR off" logged once: RC started with VR off sends no setpoint, only 158 = 0 every second
 		std::uint32_t lastRcMs = 0; ///< When RC last sent anything for the channel (setpoint or DDI 158), 0 = never
 		bool infoReceived = false; ///< Channel info (PGN 0xF4) has arrived at least once
 		std::uint16_t infoDdi = 0; ///< The channel's type from its info, 0 = not in use
