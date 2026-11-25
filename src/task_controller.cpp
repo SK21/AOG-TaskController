@@ -1606,6 +1606,7 @@ void MyTCServer::update_rate_setpoints()
 			// REFUSED stay as they are.
 			log("Rate") << "Channel " << int(channel) << ": nothing from RateController for " << RATE_TIMEOUT_MS / 1000 << " s, fallback" << std::endl;
 			rate.lost = true;
+			bool alerted = false;
 			for (auto &client : clients)
 			{
 				for (auto &element : client.second.get_rate_elements_mutable())
@@ -1641,7 +1642,13 @@ void MyTCServer::update_rate_setpoints()
 					}
 					log("Rate") << rate_element_text(element) << ": fallback, " << how << std::endl;
 					pendingRateAlerts.push_back(element.designator + ": RC lost, " + how);
+					alerted = true;
 				}
+			}
+			if (!alerted)
+			{
+				// no element on RC's rate (VR off, or OFF / REFUSED): nothing changes on the implement, but RC is gone
+				pendingRateAlerts.push_back("Channel " + std::to_string(int(channel)) + ": RC lost (implements on their own rate)");
 			}
 		}
 		else if (rate.vrOn && rate.lastReceivedMs != 0 && isobus::SystemTiming::time_expired_ms(rate.lastSentMs, RATE_RESEND_MS))
