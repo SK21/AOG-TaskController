@@ -454,13 +454,15 @@ void ClientState::store_rate_value(std::uint16_t elementNumber, std::uint16_t dd
 }
 
 MyTCServer::MyTCServer(std::shared_ptr<isobus::InternalControlFunction> internalControlFunction,
-                       isobus::TaskControllerServer::TaskControllerVersion version) :
+                       isobus::TaskControllerServer::TaskControllerVersion version,
+                       bool tcGeo) :
   TaskControllerServer(internalControlFunction,
                        1, // AOG limits to 1 boom
                        64, // AOG limits to 16 sections of unique width but can be 64 by using zones
                        64, // 64 channels for position based control
                        isobus::TaskControllerOptions()
-                         .with_implement_section_control(), // We support section control
+                         .with_implement_section_control() // We support section control
+                         .with_tc_geo_without_position_based_control(tcGeo), // the TC sends rate setpoints (RateController's map)
                        version)
 {
 }

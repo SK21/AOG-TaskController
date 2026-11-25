@@ -104,6 +104,13 @@ public:
 	/// @brief Set whether section control is switched on automatically when an implement connects.
 	bool set_section_control_on_connect(bool enabled, bool save = true);
 
+	/// @brief Check whether TC-GEO (without position-based control: the TC sends the rate setpoints) is announced.
+	/// Some implements only accept rates from a TC that announces it. Read at start.
+	bool is_announce_tc_geo() const;
+
+	/// @brief Set whether TC-GEO is announced. Takes effect after restart.
+	bool set_announce_tc_geo(bool enabled, bool save = true);
+
 	/// @brief Check whether section control is switched on when AOG opens a field, as if AOG's SC button was pressed.
 	bool is_section_control_on_field_open() const;
 
@@ -175,6 +182,7 @@ private:
 	constexpr static bool DEFAULT_VT_ENABLED = true;
 	constexpr static bool DEFAULT_SECTION_CONTROL_ON_CONNECT = true;
 	constexpr static bool DEFAULT_SECTION_CONTROL_ON_FIELD_OPEN = true;
+	constexpr static bool DEFAULT_ANNOUNCE_TC_GEO = false;
 	constexpr static std::uint8_t DEFAULT_TC_VERSION = 3; ///< SecondEditionDraft (V3 default for maximum implement compatibility)
 	static const std::string DEFAULT_LANGUAGE_CODE;
 	static const std::string DEFAULT_COUNTRY_CODE;
@@ -185,6 +193,7 @@ private:
 	bool vtEnabled = DEFAULT_VT_ENABLED;
 	bool sectionControlOnConnect = DEFAULT_SECTION_CONTROL_ON_CONNECT;
 	bool sectionControlOnFieldOpen = DEFAULT_SECTION_CONTROL_ON_FIELD_OPEN;
+	bool announceTcGeo = DEFAULT_ANNOUNCE_TC_GEO;
 	std::uint8_t tcVersion = DEFAULT_TC_VERSION;
 	std::string languageCode = DEFAULT_LANGUAGE_CODE;
 	std::string countryCode = DEFAULT_COUNTRY_CODE;

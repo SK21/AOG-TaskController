@@ -376,7 +376,8 @@ void Application::setup_task_controller_server()
 			break;
 	}
 
-	tcServer = std::make_shared<MyTCServer>(tcCF, tcVersionEnum);
+	const bool announceTcGeo = settings->is_announce_tc_geo();
+	tcServer = std::make_shared<MyTCServer>(tcCF, tcVersionEnum, announceTcGeo);
 	auto &languageInterface = tcServer->get_language_command_interface();
 	languageInterface.set_language_code(settings->get_language_code());
 	languageInterface.set_country_code(settings->get_country_code());
@@ -391,7 +392,7 @@ void Application::setup_task_controller_server()
 	tcFunctionalities->set_functionality_is_supported(
 	  isobus::ControlFunctionFunctionalities::Functionalities::TaskControllerGeoServer,
 	  1,
-	  false);
+	  announceTcGeo); // setting announceTcGeo: TC-GEO without polygon maps (the TC sends rate setpoints)
 	tcFunctionalities->set_task_controller_geo_server_option_state(
 	  isobus::ControlFunctionFunctionalities::TaskControllerGeoServerOptions::PolygonBasedPrescriptionMapsAreSupported,
 	  false);
@@ -400,7 +401,7 @@ void Application::setup_task_controller_server()
 	  1,
 	  true);
 	tcFunctionalities->set_task_controller_section_control_server_option_state(1, 64);
-	log("Init") << "TC announced TC-BAS and TC-SC (1 boom / 64 sections) via PGN 64654" << std::endl;
+	log("Init") << "TC announced TC-BAS" << (announceTcGeo ? ", TC-GEO (no polygon maps)" : "") << " and TC-SC (1 boom / 64 sections) via PGN 64654" << std::endl;
 }
 
 void Application::setup_tecu_interfaces()

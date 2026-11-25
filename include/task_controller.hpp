@@ -170,8 +170,10 @@ private:
 class MyTCServer : public isobus::TaskControllerServer
 {
 public:
+	/// @param tcGeo Announce TC-GEO without position-based control (version reply option bit 1): the TC sends rate setpoints
 	MyTCServer(std::shared_ptr<isobus::InternalControlFunction> internalControlFunction,
-	           isobus::TaskControllerServer::TaskControllerVersion version = isobus::TaskControllerServer::TaskControllerVersion::SecondEditionDraft);
+	           isobus::TaskControllerServer::TaskControllerVersion version = isobus::TaskControllerServer::TaskControllerVersion::SecondEditionDraft,
+	           bool tcGeo = false);
 	bool activate_object_pool(std::shared_ptr<isobus::ControlFunction> partnerCF, ObjectPoolActivationError &, ObjectPoolErrorCodes &, std::uint16_t &, std::uint16_t &) override;
 	bool change_designator(std::shared_ptr<isobus::ControlFunction>, std::uint16_t, const std::vector<std::uint8_t> &) override;
 	bool deactivate_object_pool(std::shared_ptr<isobus::ControlFunction> partnerCF) override;

@@ -72,6 +72,7 @@ bool Settings::load()
 	vtEnabled = loadBoolean("vtEnabled", DEFAULT_VT_ENABLED);
 	sectionControlOnConnect = loadBoolean("sectionControlOnConnect", DEFAULT_SECTION_CONTROL_ON_CONNECT);
 	sectionControlOnFieldOpen = loadBoolean("sectionControlOnFieldOpen", DEFAULT_SECTION_CONTROL_ON_FIELD_OPEN);
+	announceTcGeo = loadBoolean("announceTcGeo", DEFAULT_ANNOUNCE_TC_GEO);
 
 	if (data.contains("tcVersion"))
 	{
@@ -147,6 +148,7 @@ bool Settings::save() const
 	data["vtEnabled"] = vtEnabled;
 	data["sectionControlOnConnect"] = sectionControlOnConnect;
 	data["sectionControlOnFieldOpen"] = sectionControlOnFieldOpen;
+	data["announceTcGeo"] = announceTcGeo;
 	data["tcVersion"] = tcVersion;
 	data["languageCode"] = languageCode;
 	data["countryCode"] = countryCode;
@@ -274,6 +276,17 @@ bool Settings::is_section_control_on_connect() const
 bool Settings::set_section_control_on_connect(bool enabled, bool save)
 {
 	return set_boolean(sectionControlOnConnect, enabled, save);
+}
+
+bool Settings::is_announce_tc_geo() const
+{
+	std::scoped_lock lock(settingsMutex);
+	return announceTcGeo;
+}
+
+bool Settings::set_announce_tc_geo(bool enabled, bool save)
+{
+	return set_boolean(announceTcGeo, enabled, save);
 }
 
 bool Settings::is_section_control_on_field_open() const
