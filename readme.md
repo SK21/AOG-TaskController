@@ -66,6 +66,7 @@ AOG-TaskController reads its configuration from a `settings.json` file located i
 | `vtEnabled` | `bool` | `true` | Enables the ISOBUS Virtual Terminal UI. |
 | `sectionControlOnConnect` | `bool` | `true` | Switches section control on 2 s after an implement connects, as if AOG's SC button was pressed. |
 | `sectionControlOnFieldOpen` | `bool` | `true` | Switches section control on when AOG opens a field (a new field name, PGN 0xF3; with AOG versions that do not send the field name, section states, PGN 229, starting after a gap of more than 2 s), as if AOG's SC button was pressed. |
+| `announceTcGeo` | `bool` | `false` | Announces TC-GEO without position-based control (TC version option bit 1, and TC-GEO in PGN 64654, no polygon maps): the TC sends the rate setpoints from RateController. Some implements only take rates from a TC that announces it. Takes effect after restart. |
 | `tcVersion` | `integer` | `3` | Task Controller version code, from `0` through `4`; `3` is Second Edition Draft. |
 | `languageCode` | `string` | `"en"` | Two-character language code advertised on ISOBUS. |
 | `countryCode` | `string` | `"US"` | Two-character country code advertised on ISOBUS. |
