@@ -1686,6 +1686,13 @@ void MyTCServer::update_rate_channel_info(std::uint8_t channel, std::uint16_t dd
 	rate.infoReceived = true;
 	rate.infoDdi = ddi;
 	rate.name = name;
+	if (ddi == 0)
+	{
+		// RC stopped the channel on purpose (DDI 0 hands its elements back): no FALLBACK or "RC lost" for it.
+		// Its timer starts again with the next setpoint or DDI 158 once the channel is back in use.
+		rate.lastRcMs = 0;
+		rate.lost = false;
+	}
 
 	if (first || renamed || before != ddi)
 	{
