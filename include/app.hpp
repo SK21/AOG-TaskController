@@ -148,6 +148,7 @@ private:
 	bool sectionDemandArriving = false;
 	std::map<std::uint64_t, WorkingWithoutDemand> workingWithoutDemand; ///< Per client NAME
 	std::uint32_t vtDisconnectedSinceMs = 0;
+	std::uint32_t lastVtAddressRequestMs = 0; ///< Last request for address claims sent while the VT's address was lost, 0 = none
 	std::uint32_t lastVtStatusUpdateMs = 0;
 	std::uint32_t lastVtSectionUpdateMs = 0;
 	bool tcAddressConflictActive = false;

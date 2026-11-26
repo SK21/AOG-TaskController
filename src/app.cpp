@@ -13,6 +13,7 @@
 #include "isobus/hardware_integration/can_hardware_interface.hpp"
 #include "isobus/isobus/can_internal_control_function.hpp"
 #include "isobus/isobus/can_network_manager.hpp"
+#include "isobus/isobus/can_parameter_group_number_request_protocol.hpp"
 #include "isobus/isobus/isobus_device_descriptor_object_pool_helpers.hpp"
 #include "isobus/isobus/isobus_preferred_addresses.hpp"
 #include "isobus/isobus/isobus_standard_data_description_indices.hpp"
@@ -42,6 +43,33 @@ static std::string format_hex_address(std::uint8_t address)
 	std::ostringstream value;
 	value << "0x" << std::hex << std::uppercase << std::setw(2) << std::setfill('0') << static_cast<int>(address);
 	return value.str();
+}
+
+// The stack's VTVersion enum starts at "2 or older", so its numeric value is not the VT version
+static std::string vt_version_text(isobus::VirtualTerminalClient::VTVersion version)
+{
+	std::string retVal = "unknown";
+	switch (version)
+	{
+		case isobus::VirtualTerminalClient::VTVersion::Version2OrOlder:
+			retVal = "2 or older";
+			break;
+		case isobus::VirtualTerminalClient::VTVersion::Version3:
+			retVal = "3";
+			break;
+		case isobus::VirtualTerminalClient::VTVersion::Version4:
+			retVal = "4";
+			break;
+		case isobus::VirtualTerminalClient::VTVersion::Version5:
+			retVal = "5";
+			break;
+		case isobus::VirtualTerminalClient::VTVersion::Version6:
+			retVal = "6";
+			break;
+		default:
+			break;
+	}
+	return retVal;
 }
 
 // Enumerate and log all Control Functions on the bus
@@ -1411,6 +1439,21 @@ void Application::handle_vt_disconnected()
 	}
 	vtWasConnected = false;
 
+	// The network manager can mark the VT offline (no answer to a roll-call it saw). The VT does not
+	// claim again by itself, so the client would wait forever: ask the bus for address claims, which
+	// restores the VT when it answers.
+	constexpr std::uint32_t VT_ADDRESS_REQUEST_INTERVAL_MS = 5000;
+	auto vtPartner = vtClient->get_partner_control_function();
+	if (vtPartner && !vtPartner->get_address_valid() && tcCF && tcCF->get_address_valid() &&
+	    ((0 == lastVtAddressRequestMs) || isobus::SystemTiming::time_expired_ms(lastVtAddressRequestMs, VT_ADDRESS_REQUEST_INTERVAL_MS)))
+	{
+		lastVtAddressRequestMs = isobus::SystemTiming::get_timestamp_ms();
+		if (isobus::ParameterGroupNumberRequestProtocol::request_parameter_group_number(static_cast<std::uint32_t>(isobus::CANLibParameterGroupNumber::AddressClaim), tcCF, nullptr))
+		{
+			log("VT") << "VT address lost; asked the bus for address claims." << std::endl;
+		}
+	}
+
 	if ((!vtConnectionWarningLogged) &&
 	    isobus::SystemTiming::time_expired_ms(vtDisconnectedSinceMs, 30000))
 	{
@@ -1435,7 +1478,7 @@ void Application::log_vt_capabilities_once()
 		const auto virtualSoftkeys = vtClient->get_number_virtual_softkeys();
 		const auto physicalSoftkeys = vtClient->get_number_physical_softkeys();
 		log("VT") << "Connected to VT version "
-		          << static_cast<int>(vtClient->get_connected_vt_version())
+		          << vt_version_text(vtClient->get_connected_vt_version())
 		          << ": screen=" << vtClient->get_number_x_pixels() << "x" << vtClient->get_number_y_pixels()
 		          << ", softkey=" << static_cast<int>(vtClient->get_softkey_x_axis_pixels()) << "x" << static_cast<int>(vtClient->get_softkey_y_axis_pixels())
 		          << ", virtual softkeys=" << static_cast<int>(virtualSoftkeys)
