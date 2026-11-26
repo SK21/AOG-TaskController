@@ -22,6 +22,8 @@
 #include <iostream>
 #include <sstream>
 
+#include <nlohmann/json.hpp>
+
 /// Delay between pool activation and applying the initial section control state, so the implement
 /// has settled and answered the measurement commands before it is switched to automatic.
 static constexpr std::uint32_t INITIAL_SECTION_CONTROL_DELAY_MS = 2000;
@@ -273,6 +275,16 @@ bool ClientState::is_any_section_setpoint_on() const
 		}
 	}
 	return false;
+}
+
+bool ClientState::is_applying() const
+{
+	bool applying = actualWorkState;
+	for (std::size_t i = 0; (i < sectionActualStates.size()) && !applying; i++)
+	{
+		applying = (sectionActualStates[i] == SectionState::ON);
+	}
+	return applying;
 }
 
 bool ClientState::get_setpoint_work_state() const
@@ -1041,6 +1053,7 @@ void MyTCServer::request_measurement_commands()
 				subscribe_rate_actuals(client.first, client.second, element);
 				find_rx_ddis(client.first, client.second, element);
 			}
+			load_rate_assignments(client.first->get_NAME().get_full_name(), client.second);
 			match_rate_elements(client.first, client.second, true);
 
 			log() << "Measurement commands sent." << std::endl;
@@ -1952,20 +1965,10 @@ void MyTCServer::match_rate_elements(std::shared_ptr<isobus::ControlFunction> cl
 	{
 		const RateElement &element = elements[i];
 
-		// the channels of the element's type; exactly one is a match, two or more need an assignment
-		std::uint8_t match = 0;
+		// the operator's choice first (VT rate source page), else the channel of the element's type
 		std::uint8_t count = 0;
 		std::string sameType;
-		for (std::uint8_t channel = 1; channel <= MAX_RATE_CHANNELS; channel++)
-		{
-			if (rate_channel_ddi(channel) == element.ddi)
-			{
-				match = channel;
-				count++;
-				sameType += (sameType.empty() ? "" : ", ") + std::to_string(channel) + " \"" + rateChannels[channel - 1].name + "\"";
-			}
-		}
-		const std::uint8_t channel = (count == 1) ? match : 0;
+		const std::uint8_t channel = resolve_rate_source(element, count, sameType);
 		const bool changed = (channel != element.channel);
 
 		if (changed)
@@ -1992,8 +1995,18 @@ void MyTCServer::match_rate_elements(std::shared_ptr<isobus::ControlFunction> cl
 			if (channel != 0)
 			{
 				const std::string &name = rateChannels[channel - 1].name;
-				logText = elementText + " -> channel " + std::to_string(channel) + " \"" + name + "\"";
+				logText = elementText + " -> channel " + std::to_string(channel) + " \"" + name + "\"" + (element.assignMode == RateAssignMode::Source ? " (chosen)" : "");
 				messageText = element.designator + " -> " + (name.empty() ? "channel " + std::to_string(channel) : name);
+			}
+			else if (element.assignMode == RateAssignMode::None)
+			{
+				logText = elementText + ": no rate source (set to None)";
+				messageText = element.designator + ": no rate source";
+			}
+			else if (element.assignMode == RateAssignMode::Source)
+			{
+				logText = elementText + ": chosen source " + std::to_string(element.assignSource) + " is not in use or not this type";
+				messageText = element.designator + ": source " + std::to_string(element.assignSource) + " not available";
 			}
 			else if (count > 1)
 			{
@@ -2009,6 +2022,230 @@ void MyTCServer::match_rate_elements(std::shared_ptr<isobus::ControlFunction> cl
 			pendingRateMessages.push_back(messageText);
 		}
 	}
+}
+
+std::uint8_t MyTCServer::resolve_rate_source(const RateElement &element, std::uint8_t &autoCandidates, std::string &sameType) const
+{
+	std::uint8_t match = 0;
+	autoCandidates = 0;
+	sameType.clear();
+	for (std::uint8_t channel = 1; channel <= MAX_RATE_CHANNELS; channel++)
+	{
+		if (rate_channel_ddi(channel) == element.ddi)
+		{
+			match = channel;
+			autoCandidates++;
+			sameType += (sameType.empty() ? "" : ", ") + std::to_string(channel) + " \"" + rateChannels[channel - 1].name + "\"";
+		}
+	}
+
+	std::uint8_t result = 0;
+	switch (element.assignMode)
+	{
+		case RateAssignMode::Source:
+			if ((element.assignSource >= 1) && (element.assignSource <= MAX_RATE_CHANNELS) && (rate_channel_ddi(element.assignSource) == element.ddi))
+			{
+				result = element.assignSource;
+			}
+			break;
+		case RateAssignMode::None:
+			break;
+		default:
+			result = (autoCandidates == 1) ? match : 0;
+			break;
+	}
+	return result;
+}
+
+void MyTCServer::load_rate_assignments(std::uint64_t clientName, ClientState &state)
+{
+	const std::string fileName = std::to_string(clientName) + "/rate_assignments.json";
+	bool dropped = false;
+	try
+	{
+		std::ifstream file(Settings::get_filename_path(fileName));
+		if (file.is_open())
+		{
+			const auto data = nlohmann::json::parse(file);
+			for (const auto &entry : data.value("elements", nlohmann::json::array()))
+			{
+				const std::uint16_t elementNumber = entry.value("element", static_cast<std::uint16_t>(0xFFFF));
+				const std::uint16_t ddi = entry.value("ddi", static_cast<std::uint16_t>(0));
+				const std::string mode = entry.value("mode", std::string("auto"));
+				const std::uint8_t source = entry.value("source", static_cast<std::uint8_t>(0));
+
+				bool found = false;
+				bool sameElementOtherDdi = false;
+				for (auto &element : state.get_rate_elements_mutable())
+				{
+					if (element.elementNumber != elementNumber)
+					{
+						continue;
+					}
+					if (element.ddi != ddi)
+					{
+						sameElementOtherDdi = true;
+						continue;
+					}
+					found = true;
+					if (mode == "none")
+					{
+						element.assignMode = RateAssignMode::None;
+						element.assignSource = 0;
+					}
+					else if ((mode == "source") && (source >= 1) && (source <= MAX_RATE_CHANNELS))
+					{
+						element.assignMode = RateAssignMode::Source;
+						element.assignSource = source;
+					}
+					log("Rate") << "Element " << element.elementNumber << " \"" << element.designator << "\" (DDI " << element.ddi
+					            << "): stored rate source " << (element.assignMode == RateAssignMode::None ? std::string("None") : std::to_string(element.assignSource)) << std::endl;
+				}
+				if (!found)
+				{
+					dropped = true;
+					log("Rate") << "Stored rate source for element " << elementNumber << " (DDI " << ddi << ") dropped: "
+					            << (sameElementOtherDdi ? "the element's rate DDI changed, back to Auto" : "the element is gone") << std::endl;
+				}
+			}
+		}
+	}
+	catch (const std::exception &e)
+	{
+		log("Rate") << "Could not read " << fileName << ": " << e.what() << "; all elements on Auto" << std::endl;
+	}
+
+	if (dropped)
+	{
+		save_rate_assignments(clientName, state);
+	}
+}
+
+void MyTCServer::save_rate_assignments(std::uint64_t clientName, const ClientState &state)
+{
+	const std::string fileName = std::to_string(clientName) + "/rate_assignments.json";
+	nlohmann::json elements = nlohmann::json::array();
+	for (const auto &element : state.get_rate_elements())
+	{
+		if (element.assignMode == RateAssignMode::Auto)
+		{
+			continue;
+		}
+		nlohmann::json entry;
+		entry["element"] = element.elementNumber;
+		entry["ddi"] = element.ddi;
+		entry["designator"] = element.designator;
+		entry["mode"] = (element.assignMode == RateAssignMode::None) ? "none" : "source";
+		if (element.assignMode == RateAssignMode::Source)
+		{
+			entry["source"] = element.assignSource;
+			entry["sourceName"] = rateChannels[element.assignSource - 1].name; // for the reader and the log only
+		}
+		elements.push_back(entry);
+	}
+
+	try
+	{
+		std::ofstream file(Settings::get_filename_path(fileName));
+		if (file.is_open())
+		{
+			file << nlohmann::json{ { "elements", elements } }.dump(4) << std::endl;
+		}
+		else
+		{
+			log("Rate") << "Could not write " << fileName << std::endl;
+		}
+	}
+	catch (const std::exception &e)
+	{
+		log("Rate") << "Could not write " << fileName << ": " << e.what() << std::endl;
+	}
+}
+
+RateAssignmentSnapshot MyTCServer::get_rate_assignments()
+{
+	std::lock_guard<std::recursive_mutex> lock(clientsMutex);
+	RateAssignmentSnapshot snapshot;
+	for (std::uint8_t channel = 1; channel <= MAX_RATE_CHANNELS; channel++)
+	{
+		const RateChannel &rate = rateChannels[channel - 1];
+		RateSourceInfo source;
+		source.id = channel;
+		source.name = rate.name;
+		source.ddi = rate_channel_ddi(channel);
+		source.hasSetpoint = rate.vrOn && (rate.lastReceivedMs != 0) && !rate.lost;
+		source.setpoint = rate.value;
+		snapshot.sources.push_back(source);
+	}
+
+	std::uint8_t clientIndex = 0;
+	for (auto &client : clients)
+	{
+		clientIndex++;
+		const bool applying = client.second.is_applying();
+		for (const auto &element : client.second.get_rate_elements())
+		{
+			RateAssignmentRow row;
+			row.clientName = client.first->get_NAME().get_full_name();
+			row.clientIndex = clientIndex;
+			row.elementNumber = element.elementNumber;
+			row.ddi = element.ddi;
+			row.designator = element.designator;
+			row.mode = element.assignMode;
+			row.source = element.assignSource;
+			row.resolved = element.channel;
+			std::string sameType;
+			resolve_rate_source(element, row.autoCandidates, sameType);
+			row.rxState = element.rxState;
+			row.applying = applying;
+			snapshot.rows.push_back(row);
+		}
+	}
+	return snapshot;
+}
+
+RateAssignResult MyTCServer::set_rate_assignment(std::uint64_t clientName, std::uint16_t elementNumber, std::uint16_t ddi, RateAssignMode mode, std::uint8_t source)
+{
+	std::lock_guard<std::recursive_mutex> lock(clientsMutex);
+	RateAssignResult result = RateAssignResult::NotFound;
+	const bool validChoice = (mode != RateAssignMode::Source) || ((source >= 1) && (source <= MAX_RATE_CHANNELS));
+	for (auto &client : clients)
+	{
+		if (!validChoice || (result != RateAssignResult::NotFound) || (client.first->get_NAME().get_full_name() != clientName))
+		{
+			continue;
+		}
+		for (auto &element : client.second.get_rate_elements_mutable())
+		{
+			if ((result != RateAssignResult::NotFound) || (element.elementNumber != elementNumber) || (element.ddi != ddi))
+			{
+				continue;
+			}
+
+			const std::uint8_t newSource = (mode == RateAssignMode::Source) ? source : 0;
+			const std::string elementText = "Element " + std::to_string(element.elementNumber) + " \"" + element.designator + "\" (DDI " + std::to_string(element.ddi) + ")";
+			const std::string choiceText = (mode == RateAssignMode::Auto) ? std::string("Auto") : (mode == RateAssignMode::None) ? std::string("None") : std::to_string(newSource) + " \"" + rateChannels[newSource - 1].name + "\"";
+			if ((element.assignMode == mode) && (element.assignSource == newSource))
+			{
+				result = RateAssignResult::Unchanged;
+			}
+			else if (client.second.is_applying())
+			{
+				result = RateAssignResult::Applying;
+				log("Rate") << elementText << ": rate source " << choiceText << " refused on the VT, the implement is applying (turn sections off)" << std::endl;
+			}
+			else
+			{
+				result = RateAssignResult::Done;
+				element.assignMode = mode;
+				element.assignSource = newSource;
+				log("Rate") << elementText << ": rate source set to " << choiceText << " on the VT" << std::endl;
+				save_rate_assignments(clientName, client.second);
+				match_rate_elements(client.first, client.second, false);
+			}
+		}
+	}
+	return result;
 }
 
 void MyTCServer::send_gnss_quality(std::uint8_t quality)

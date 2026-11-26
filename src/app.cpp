@@ -24,6 +24,7 @@
 #include "task_controller.hpp"
 
 #include "AOG_TC.iop.h"
+#include "assign_page.hpp"
 
 #include "logging_utils.hpp"
 
@@ -1287,6 +1288,17 @@ void Application::setup_vt_client()
 {
 	vtObjectPool.assign(std::begin(AOG_TC_IOP_DATA), std::end(AOG_TC_IOP_DATA));
 	log("VT") << "Loaded embedded object pool (" << vtObjectPool.size() << " bytes)" << std::endl;
+	std::string assignPageError;
+	assignPageAvailable = assign_page::add_to_pool(vtObjectPool, assignPageError);
+	if (assignPageAvailable)
+	{
+		log("VT") << "Rate source page added (" << vtObjectPool.size() << " bytes)" << std::endl;
+	}
+	else
+	{
+		log("VT") << "WARNING: rate source page not added: " << assignPageError << std::endl;
+	}
+	clear_assign_page_cache();
 
 	// Partner filter for any Virtual Terminal server on the bus.
 	const isobus::NAMEFilter filterVirtualTerminal(isobus::NAME::NAMEParameters::FunctionCode, static_cast<std::uint8_t>(isobus::NAME::Function::VirtualTerminal));
@@ -1298,7 +1310,7 @@ void Application::setup_vt_client()
 	// reuse an unscaled pool stored by an older build with the same IOP bytes.
 	auto poolVersionData = vtObjectPool;
 	const std::string scalingCacheSalt =
-	  "scaled:" + std::to_string(ISO_MASK_SIZE) + ":" + std::to_string(ISO_DESIGNATOR_HEIGHT) + ":v1";
+	  "scaled:" + std::to_string(ISO_MASK_SIZE) + ":" + std::to_string(ISO_DESIGNATOR_HEIGHT) + ":v2";
 	poolVersionData.insert(poolVersionData.end(), scalingCacheSalt.begin(), scalingCacheSalt.end());
 	const std::string poolHash = isobus::IOPFileInterface::hash_object_pool_to_version(poolVersionData);
 	vtClient->set_object_pool(0, vtObjectPool.data(), static_cast<std::uint32_t>(vtObjectPool.size()), poolHash);
@@ -1328,6 +1340,20 @@ void Application::setup_vt_client()
 			case NavConfig:
 				targetMask = DataMask_Config;
 				break;
+			case assign_page::Key_Back:
+				targetMask = DataMask_Implement;
+				break;
+			case assign_page::Key_Prev:
+				if (assignPageIndex > 0)
+				{
+					assignPageIndex--;
+				}
+				update_vt_assign_page(true);
+				break;
+			case assign_page::Key_Next:
+				assignPageIndex++; // clamped to the last page by update_vt_assign_page
+				update_vt_assign_page(true);
+				break;
 			default:
 				break;
 		}
@@ -1336,10 +1362,19 @@ void Application::setup_vt_client()
 		{
 			vtClient->send_change_active_mask(WorkingSet_0, targetMask);
 			log("VT") << "Navigating to mask " << targetMask << std::endl;
+			show_assign_page(targetMask == assign_page::DataMask_Assign);
 		}
 	});
-	vtClient->get_vt_button_event_dispatcher().add_listener([](const isobus::VirtualTerminalClient::VTKeyEvent &event) {
+	vtClient->get_vt_button_event_dispatcher().add_listener([this](const isobus::VirtualTerminalClient::VTKeyEvent &event) {
 		log("VT") << "Button event, key=" << static_cast<int>(event.keyNumber) << std::endl;
+		if (assignPageAvailable && (event.objectID == assign_page::Button_RateSources) &&
+		    (event.keyEvent == isobus::VirtualTerminalClient::KeyActivationCode::ButtonUnlatchedOrReleased))
+		{
+			assignPageIndex = 0;
+			vtClient->send_change_active_mask(WorkingSet_0, assign_page::DataMask_Assign);
+			log("VT") << "Navigating to mask " << assign_page::DataMask_Assign << std::endl;
+			show_assign_page(true);
+		}
 	});
 	vtUpdateHelper = std::make_unique<isobus::VirtualTerminalClientUpdateHelper>(vtClient);
 	vtUpdateHelper->add_tracked_numeric_value(VTSpeedValue, 0);
@@ -1353,6 +1388,13 @@ void Application::setup_vt_client()
 		const bool enabled = (value != 0);
 		bool handled = true;
 		bool saved = true;
+		for (std::uint8_t row = 0; row < assign_page::ROWS; row++)
+		{
+			if (assignPageAvailable && (objectID == assign_page::row_list(row)))
+			{
+				on_assign_list_changed(row, value);
+			}
+		}
 		switch (objectID)
 		{
 			case ConfigNmeaSend:
@@ -1469,6 +1511,8 @@ void Application::handle_vt_disconnected()
 
 	lastVtStrings.clear();
 	vtConfigSynced = false;
+	clear_assign_page_cache();
+	assignPageShown = false; // a reconnecting VT starts on the pool's first mask
 }
 
 void Application::log_vt_capabilities_once()
@@ -1545,6 +1589,314 @@ void Application::update_vt_section_map()
 	}
 }
 
+namespace
+{
+	// Printable ASCII only (DDOP designators may be in another encoding), cut to the object's length
+	std::string vt_text(const std::string &text, std::size_t length)
+	{
+		std::string result;
+		for (char c : text)
+		{
+			const auto byte = static_cast<unsigned char>(c);
+			if ((result.size() < length) && (byte >= 0x20) && (byte < 0x7F))
+			{
+				result.push_back(c);
+			}
+		}
+		return result;
+	}
+
+	const char *rate_unit_text(std::uint16_t ddi)
+	{
+		const char *text = "";
+		switch (ddi)
+		{
+			case 1:
+				text = "L/ha";
+				break;
+			case 6:
+				text = "kg/ha";
+				break;
+			case 11:
+				text = "k/ha";
+				break;
+			default:
+				break;
+		}
+		return text;
+	}
+
+	// A raw setpoint in the page's unit: DDI 1 mm3/m2 x0.01 -> L/ha, DDI 6 mg/m2 -> kg/ha, DDI 11 /m2 x0.001 -> 1000/ha
+	double rate_in_page_unit(std::uint16_t ddi, std::int32_t raw)
+	{
+		double value = 0.0;
+		switch (ddi)
+		{
+			case 1:
+				value = raw / 10000.0;
+				break;
+			case 6:
+				value = raw / 100.0;
+				break;
+			case 11:
+				value = raw / 100.0;
+				break;
+			default:
+				break;
+		}
+		return value;
+	}
+
+	std::string rate_now_text(std::uint8_t source, std::uint16_t ddi, std::int32_t raw)
+	{
+		const double value = rate_in_page_unit(ddi, raw);
+		std::ostringstream text;
+		text << static_cast<int>(source) << ':' << std::fixed << std::setprecision(value < 100.0 ? 1 : 0) << value;
+		return text.str();
+	}
+}
+
+void Application::clear_assign_page_cache()
+{
+	for (auto &slots : assignListItems)
+	{
+		slots.fill(0);
+	}
+	assignListValues.fill(ASSIGN_VALUE_UNKNOWN);
+	assignSoftKeysShown = assign_page::SoftKeys_Assign; // as in the pool
+}
+
+void Application::show_assign_page(bool shown)
+{
+	assignPageShown = shown && assignPageAvailable;
+	if (assignPageShown)
+	{
+		update_vt_assign_page(true);
+	}
+}
+
+void Application::send_assign_list_item_if_changed(std::uint8_t row, std::uint8_t slot, std::uint16_t item)
+{
+	if (assignListItems[row][slot] != item)
+	{
+		if (vtClient->send_change_list_item(assign_page::row_list(row), slot, item))
+		{
+			assignListItems[row][slot] = item;
+		}
+	}
+}
+
+void Application::send_assign_list_value_if_changed(std::uint8_t row, std::uint8_t value)
+{
+	if (assignListValues[row] != value)
+	{
+		if (vtClient->send_change_numeric_value(assign_page::row_list(row), value))
+		{
+			assignListValues[row] = value;
+		}
+	}
+}
+
+void Application::update_vt_assign_page(bool force)
+{
+	if (assignPageAvailable && assignPageShown && vtClient && vtClient->get_is_connected() &&
+	    (force || isobus::SystemTiming::time_expired_ms(lastAssignPageUpdateMs, 1000)))
+	{
+		lastAssignPageUpdateMs = isobus::SystemTiming::get_timestamp_ms();
+		refresh_vt_assign_page();
+	}
+}
+
+void Application::refresh_vt_assign_page()
+{
+	const RateAssignmentSnapshot snapshot = tcServer->get_rate_assignments();
+	const std::size_t pages = std::max<std::size_t>(1, (snapshot.rows.size() + assign_page::ROWS - 1) / assign_page::ROWS);
+	if (assignPageIndex >= pages)
+	{
+		assignPageIndex = static_cast<std::uint8_t>(pages - 1);
+	}
+	std::uint8_t implements = 0;
+	for (const auto &row : snapshot.rows)
+	{
+		implements = std::max(implements, row.clientIndex);
+	}
+	auto rowLabel = [implements](const RateAssignmentRow &row) {
+		const std::string name = row.designator.empty() ? "Element " + std::to_string(row.elementNumber) : row.designator;
+		return (implements > 1 ? std::to_string(row.clientIndex) + ":" : std::string()) + name;
+	};
+
+	// Source names in the shared list items
+	for (const auto &source : snapshot.sources)
+	{
+		if ((source.id >= 1) && (source.id <= assign_page::MAX_SOURCES))
+		{
+			send_vt_string_if_changed(assign_page::item_source(source.id), vt_text(std::to_string(source.id) + " " + source.name, assign_page::LEN_ITEM));
+		}
+	}
+
+	send_vt_string_if_changed(assign_page::Str_Page, "Page " + std::to_string(assignPageIndex + 1) + "/" + std::to_string(pages));
+	const std::uint16_t softKeys = (pages > 1) ? assign_page::SoftKeys_AssignPaged : assign_page::SoftKeys_Assign;
+	if (softKeys != assignSoftKeysShown)
+	{
+		if (vtClient->send_change_softkey_mask(isobus::VirtualTerminalClient::MaskType::DataMask, assign_page::DataMask_Assign, softKeys))
+		{
+			assignSoftKeysShown = softKeys;
+		}
+	}
+
+	for (std::uint8_t row = 0; row < assign_page::ROWS; row++)
+	{
+		const std::size_t index = static_cast<std::size_t>(assignPageIndex) * assign_page::ROWS + row;
+		AssignRowKey &key = assignRows[row];
+		if (index >= snapshot.rows.size())
+		{
+			key = AssignRowKey();
+			send_vt_string_if_changed(assign_page::row_element(row), "");
+			send_vt_string_if_changed(assign_page::row_type(row), "");
+			send_vt_string_if_changed(assign_page::row_now(row), "");
+			for (std::uint8_t slot = 0; slot < assign_page::LIST_SLOTS; slot++)
+			{
+				send_assign_list_item_if_changed(row, slot, isobus::NULL_OBJECT_ID);
+			}
+			send_assign_list_value_if_changed(row, 0xFF);
+			continue;
+		}
+
+		const RateAssignmentRow &element = snapshot.rows[index];
+		std::uint8_t storedSlot = assign_page::SLOT_AUTO;
+		if (element.mode == RateAssignMode::None)
+		{
+			storedSlot = assign_page::SLOT_NONE;
+		}
+		else if (element.mode == RateAssignMode::Source)
+		{
+			storedSlot = static_cast<std::uint8_t>(assign_page::SLOT_FIRST_SOURCE + element.source - 1);
+		}
+		key.used = true;
+		key.clientName = element.clientName;
+		key.elementNumber = element.elementNumber;
+		key.ddi = element.ddi;
+		key.storedSlot = storedSlot;
+
+		send_vt_string_if_changed(assign_page::row_element(row), vt_text(rowLabel(element), assign_page::LEN_ELEMENT));
+		send_vt_string_if_changed(assign_page::row_type(row), rate_unit_text(element.ddi));
+
+		// The list offers None, Auto and the sources of the element's type (plus a chosen one that is no longer available)
+		send_assign_list_item_if_changed(row, assign_page::SLOT_NONE, assign_page::Item_None);
+		send_assign_list_item_if_changed(row, assign_page::SLOT_AUTO, assign_page::Item_Auto);
+		for (const auto &source : snapshot.sources)
+		{
+			if ((source.id < 1) || (source.id > assign_page::MAX_SOURCES))
+			{
+				continue;
+			}
+			const bool offered = (source.ddi == element.ddi) || ((element.mode == RateAssignMode::Source) && (element.source == source.id));
+			send_assign_list_item_if_changed(row, static_cast<std::uint8_t>(assign_page::SLOT_FIRST_SOURCE + source.id - 1), offered ? assign_page::item_source(source.id) : isobus::NULL_OBJECT_ID);
+		}
+		send_assign_list_value_if_changed(row, storedSlot);
+
+		std::string now = "--";
+		if (element.resolved != 0)
+		{
+			const RateSourceInfo &source = snapshot.sources[element.resolved - 1];
+			switch (element.rxState)
+			{
+				case RxState::Starting:
+				case RxState::Active:
+					now = source.hasSetpoint ? rate_now_text(element.resolved, element.ddi, source.setpoint) : std::to_string(element.resolved) + ":--";
+					break;
+				case RxState::Refused:
+					now = "refused";
+					break;
+				case RxState::Fallback:
+					now = "default";
+					break;
+				default:
+					now = "own";
+					break;
+			}
+		}
+		send_vt_string_if_changed(assign_page::row_now(row), vt_text(now, assign_page::LEN_NOW));
+	}
+
+	// Warning line: a refusal for a few seconds, else the first element that has no source
+	std::string warning;
+	if (!assignNotice.empty() && !isobus::SystemTiming::time_expired_ms(assignNoticeMs, ASSIGN_NOTICE_MS))
+	{
+		warning = assignNotice;
+	}
+	for (const auto &element : snapshot.rows)
+	{
+		if (!warning.empty())
+		{
+			break;
+		}
+		if ((element.mode == RateAssignMode::Source) && (element.resolved == 0))
+		{
+			warning = "! " + rowLabel(element) + ": source " + std::to_string(element.source) + " not available";
+		}
+		else if ((element.mode == RateAssignMode::Auto) && (element.autoCandidates > 1))
+		{
+			warning = "! " + rowLabel(element) + ": choose a source";
+		}
+	}
+	if (snapshot.rows.empty())
+	{
+		warning = "No implement rate elements";
+	}
+	else if (warning.empty())
+	{
+		warning = "Select a source in each white box";
+	}
+	send_vt_string_if_changed(assign_page::Str_Warning, vt_text(warning, assign_page::LEN_WARNING));
+}
+
+void Application::on_assign_list_changed(std::uint8_t row, std::uint32_t value)
+{
+	const AssignRowKey key = assignRows[row];
+	assignListValues[row] = static_cast<std::uint8_t>(value); // what the VT shows now
+
+	RateAssignMode mode = RateAssignMode::Auto;
+	std::uint8_t source = 0;
+	bool valid = key.used;
+	if (value == assign_page::SLOT_NONE)
+	{
+		mode = RateAssignMode::None;
+	}
+	else if (value == assign_page::SLOT_AUTO)
+	{
+		mode = RateAssignMode::Auto;
+	}
+	else if ((value >= assign_page::SLOT_FIRST_SOURCE) && (value < assign_page::LIST_SLOTS))
+	{
+		mode = RateAssignMode::Source;
+		source = static_cast<std::uint8_t>(value - assign_page::SLOT_FIRST_SOURCE + 1);
+	}
+	else
+	{
+		valid = false;
+	}
+
+	RateAssignResult result = RateAssignResult::NotFound;
+	if (valid)
+	{
+		result = tcServer->set_rate_assignment(key.clientName, key.elementNumber, key.ddi, mode, source);
+	}
+	if (result == RateAssignResult::Applying)
+	{
+		assignNotice = "Turn sections off to change sources";
+		assignNoticeMs = isobus::SystemTiming::get_timestamp_ms();
+		send_hardware_message("Rate source not changed: turn sections off first", 5, HW_MSG_ALERT);
+	}
+	if ((result == RateAssignResult::Applying) || (result == RateAssignResult::NotFound))
+	{
+		// set the list back to the stored choice
+		assignListValues[row] = ASSIGN_VALUE_UNKNOWN;
+		send_assign_list_value_if_changed(row, key.used ? key.storedSlot : static_cast<std::uint8_t>(0xFF));
+	}
+	update_vt_assign_page(true);
+}
+
 void Application::update_vt_client()
 {
 	if (!vtClientStarted)
@@ -1585,6 +1937,7 @@ void Application::update_vt_client()
 	vtUpdateHelper->set_numeric_value(ConfigTecuEnabled, settings->is_tecu_enabled());
 
 	update_vt_section_map();
+	update_vt_assign_page(false);
 
 	if (!isobus::SystemTiming::time_expired_ms(lastVtStatusUpdateMs, 1000))
 	{

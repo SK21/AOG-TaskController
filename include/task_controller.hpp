@@ -44,6 +44,56 @@ enum class RxState : std::uint8_t
 	Fallback = 4 ///< Nothing from RC for RATE_TIMEOUT_MS: its default rate (287 = 2), else handed back (158 = 0)
 };
 
+/// @brief How a rate element picks its rate source (the operator's choice on the VT rate source page)
+enum class RateAssignMode : std::uint8_t
+{
+	Auto = 0, ///< The only in-use source of the element's type; none when there are two or more
+	Source = 1, ///< The source the operator chose, while it is in use and of the element's type
+	None = 2 ///< No source: the implement uses its own rate
+};
+
+/// @brief A rate source the page can offer (today RateController's products)
+struct RateSourceInfo
+{
+	std::uint8_t id = 0; ///< 1 to MyTCServer::MAX_RATE_CHANNELS
+	std::string name; ///< As the source names it
+	std::uint16_t ddi = 0; ///< Its rate DDI (1, 6 or 11), 0 = not in use
+	bool hasSetpoint = false; ///< A setpoint is flowing (VR on, not lost)
+	std::int32_t setpoint = 0; ///< Last setpoint, raw in ddi's unit
+};
+
+/// @brief One implement rate element as the rate source page shows it
+struct RateAssignmentRow
+{
+	std::uint64_t clientName = 0; ///< The implement's NAME
+	std::uint8_t clientIndex = 0; ///< 1-based position among connected implements, for labels
+	std::uint16_t elementNumber = 0;
+	std::uint16_t ddi = 0;
+	std::string designator;
+	RateAssignMode mode = RateAssignMode::Auto;
+	std::uint8_t source = 0; ///< The chosen source when mode is Source
+	std::uint8_t resolved = 0; ///< The source driving it now, 0 = none
+	std::uint8_t autoCandidates = 0; ///< In-use sources of its type (Auto picks one only when this is 1)
+	RxState rxState = RxState::Off;
+	bool applying = false; ///< Its implement has a section or work state on: assignments are locked (D3)
+};
+
+/// @brief Everything the rate source page needs, copied under the clients lock
+struct RateAssignmentSnapshot
+{
+	std::vector<RateSourceInfo> sources; ///< Every source slot, in use or not
+	std::vector<RateAssignmentRow> rows;
+};
+
+/// @brief Result of an operator's assignment change
+enum class RateAssignResult : std::uint8_t
+{
+	Done = 0,
+	Unchanged = 1,
+	Applying = 2, ///< Refused: the implement is applying (D3)
+	NotFound = 3 ///< The implement or element is gone
+};
+
 /// @brief An implement element that takes a rate setpoint, and the rate channel that drives it
 struct RateElement
 {
@@ -83,6 +133,10 @@ struct RateElement
 	std::uint32_t rxAskedMs = 0; ///< When it was requested
 	std::uint8_t rxTries = 0; ///< Commands sent for this request (RX_TRIES without a reply = no reply)
 	bool noReply = false; ///< No reply to 158 after the resends; cleared when it reports 158 or a new request starts
+
+	// rate source assignment (VT rate source page), stored per implement in <NAME>/rate_assignments.json
+	RateAssignMode assignMode = RateAssignMode::Auto;
+	std::uint8_t assignSource = 0; ///< The chosen source when assignMode is Source
 };
 
 /// @brief What one rate channel's elements report, for RateController (PGN 0xF5)
@@ -111,6 +165,8 @@ public:
 	void set_element_number_for_section(std::uint8_t section, std::uint16_t elementNumber);
 	bool try_get_section_for_element(std::uint16_t elementNumber, std::uint8_t &section) const;
 	bool is_any_section_setpoint_on() const;
+	/// @brief A section reports on, or the implement's actual work state is on
+	bool is_applying() const;
 	bool get_setpoint_work_state() const;
 	void set_setpoint_work_state(bool state);
 	bool get_actual_work_state() const;
@@ -243,6 +299,13 @@ public:
 	/// @brief Returns (and clears) the element-to-channel changes since the last call, for AOG's hardware message
 	std::vector<std::string> take_rate_messages();
 
+	/// @brief The rate sources and every implement's rate elements, for the VT rate source page
+	RateAssignmentSnapshot get_rate_assignments();
+
+	/// @brief The operator's rate source choice for one element (VT rate source page). Refused while the
+	/// implement is applying (D3). Saved to the implement's rate_assignments.json and re-matched at once.
+	RateAssignResult set_rate_assignment(std::uint64_t clientName, std::uint16_t elementNumber, std::uint16_t ddi, RateAssignMode mode, std::uint8_t source);
+
 	/// @brief Each channel's actual rate and total from its elements, for PGN 0xF5. Includes, once, a channel
 	/// that just lost its elements (elements 0, flags 0). Call about once a second; also requests totals that
 	/// the implement only sends on request.
@@ -296,6 +359,15 @@ private:
 	/// @brief Finds 158, 287, 288 and the default rate on the element or a parent, and asks for 158 / 288 on change
 	void find_rx_ddis(std::shared_ptr<isobus::ControlFunction> client, ClientState &state, RateElement &element);
 	static std::string rate_element_text(const RateElement &element);
+
+	/// @brief The source an element follows under its assignment: Auto = the only in-use source of its type,
+	/// Source = the chosen one if in use and of its type, None = 0. Caller must hold clientsMutex.
+	std::uint8_t resolve_rate_source(const RateElement &element, std::uint8_t &autoCandidates, std::string &sameType) const;
+	/// @brief Reads <NAME>/rate_assignments.json into the client's rate elements. A stored choice whose DDI no
+	/// longer matches the element is dropped (back to Auto) and logged. Caller must hold clientsMutex.
+	void load_rate_assignments(std::uint64_t clientName, ClientState &state);
+	/// @brief Writes the client's non-Auto choices to <NAME>/rate_assignments.json. Caller must hold clientsMutex.
+	void save_rate_assignments(std::uint64_t clientName, const ClientState &state);
 
 	/// @brief Sends every condensed setpoint block and DDI 289, even when unchanged (ISO 11783-10 F.3.5.3 b)
 	void send_all_section_setpoint_states(std::shared_ptr<isobus::ControlFunction> client);

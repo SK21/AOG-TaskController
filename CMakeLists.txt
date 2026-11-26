@@ -207,6 +207,28 @@ if(AOG_TC_VALIDATE_IOP)
   add_dependencies(iop_validator test_element_hierarchy)
   add_test(NAME element_hierarchy COMMAND test_element_hierarchy)
 
+  # The pool as uploaded: AOG_TC.iop plus the rate source page generated in
+  # src/assign_page.cpp, written out and checked by the same validator.
+  add_executable(
+    build_assign_pool ${CMAKE_CURRENT_LIST_DIR}/tools/build_assign_pool.cpp
+                      ${CMAKE_CURRENT_LIST_DIR}/src/assign_page.cpp)
+  target_compile_features(build_assign_pool PRIVATE cxx_std_20)
+  set_target_properties(build_assign_pool PROPERTIES CXX_EXTENSIONS OFF)
+  target_include_directories(
+    build_assign_pool
+    PRIVATE ${CMAKE_CURRENT_LIST_DIR}/include ${CMAKE_CURRENT_LIST_DIR}/resources
+            ${AOG_TC_GENERATED_INCLUDE_DIR})
+  add_dependencies(iop_validator build_assign_pool)
+  set(AOG_TC_FULL_IOP "${CMAKE_CURRENT_BINARY_DIR}/assign_pool.iop")
+  add_test(NAME assign_page_pool_build COMMAND build_assign_pool
+                                               "${AOG_TC_FULL_IOP}")
+  set_tests_properties(assign_page_pool_build PROPERTIES FIXTURES_SETUP
+                                                         assign_pool)
+  add_test(NAME assign_page_pool_valid COMMAND iop_validator
+                                               "${AOG_TC_FULL_IOP}")
+  set_tests_properties(assign_page_pool_valid PROPERTIES FIXTURES_REQUIRED
+                                                         assign_pool)
+
   # PASS_REGULAR_EXPRESSION makes CTest ignore the exit code, which is the part
   # a CI gate actually reads.
   add_test(NAME malformed_pool_exit_status COMMAND iop_validator

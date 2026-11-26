@@ -9,6 +9,7 @@
 #pragma once
 
 #include <boost/asio.hpp>
+#include <array>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -23,6 +24,7 @@
 #include "isobus/isobus/isobus_virtual_terminal_client_update_helper.hpp"
 #include "isobus/isobus/nmea2000_message_interface.hpp"
 
+#include "assign_page.hpp"
 #include "logging_utils.hpp"
 #include "settings.hpp"
 #include "task_controller.hpp"
@@ -84,6 +86,38 @@ private:
 	void update_vt_status_strings(bool aogConnected);
 
 	void send_vt_string_if_changed(std::uint16_t objectID, const std::string &value);
+
+	// Rate source page (assign_page.hpp)
+	/// @brief Refreshes the page while it is shown: once a second, or at once when force is set
+	void update_vt_assign_page(bool force);
+	void refresh_vt_assign_page();
+	/// @brief The operator picked an item in a row's list: store it, or set it back while applying
+	void on_assign_list_changed(std::uint8_t row, std::uint32_t value);
+	void show_assign_page(bool shown);
+	void send_assign_list_item_if_changed(std::uint8_t row, std::uint8_t slot, std::uint16_t item);
+	void send_assign_list_value_if_changed(std::uint8_t row, std::uint8_t value);
+	void clear_assign_page_cache();
+
+	struct AssignRowKey
+	{
+		bool used = false;
+		std::uint64_t clientName = 0;
+		std::uint16_t elementNumber = 0;
+		std::uint16_t ddi = 0;
+		std::uint8_t storedSlot = 0xFF; ///< The list slot of the element's stored choice
+	};
+	static constexpr std::uint8_t ASSIGN_VALUE_UNKNOWN = 0xFE; ///< Not sent since the VT connected
+	static constexpr std::uint32_t ASSIGN_NOTICE_MS = 6000; ///< How long a refusal stays on the warning line
+	bool assignPageAvailable = false; ///< The page's objects are in the pool
+	bool assignPageShown = false; ///< DataMask_Assign is the active mask
+	std::uint8_t assignPageIndex = 0;
+	std::uint16_t assignSoftKeysShown = assign_page::SoftKeys_Assign; ///< The page's soft key mask on the VT
+	std::uint32_t lastAssignPageUpdateMs = 0;
+	std::array<AssignRowKey, assign_page::ROWS> assignRows{};
+	std::array<std::array<std::uint16_t, assign_page::LIST_SLOTS>, assign_page::ROWS> assignListItems{}; ///< 0 = not sent
+	std::array<std::uint8_t, assign_page::ROWS> assignListValues{};
+	std::string assignNotice; ///< A refusal shown on the warning line
+	std::uint32_t assignNoticeMs = 0;
 	void send_hardware_message(const std::string &text, std::uint8_t duration, std::uint8_t color);
 	ImplementDetails derive_implement_details(ClientState &state) const;
 
